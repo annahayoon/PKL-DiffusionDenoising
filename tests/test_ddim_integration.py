@@ -9,8 +9,7 @@ from pathlib import Path
 from pkl_dg.models.sampler import DDIMSampler
 from pkl_dg.guidance import PKLGuidance, L2Guidance, AnscombeGuidance, AdaptiveSchedule
 from pkl_dg.data import IntensityToModel
-from pkl_dg.physics.forward_model import ForwardModel
-from pkl_dg.physics.psf import PSF
+from pkl_dg.physics import ForwardModel, PSF
 
 
 class RealisticDiffusionModel(nn.Module):

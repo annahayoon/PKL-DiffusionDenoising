@@ -1,0 +1,185 @@
+# Configuration for Dual-Objective DDPM Training
+# Optimized for spatial resolution + pixel intensity prediction
+
+# Experiment configuration
+experiment:
+  name: "dual_objective_microscopy"
+  description: "DDPM with dual-objective loss for spatial resolution and intensity mapping"
+  tags: ["dual-objective", "microscopy", "spatial-resolution", "intensity-mapping"]
+
+# Data configuration with adaptive normalization
+data:
+  _target_: pkl_dg.data.adaptive_dataset.AdaptiveRealPairsDataset
+  data_dir: "data/real_microscopy"
+  normalization_params_path: "data/real_microscopy/adaptive_normalization_params.json"
+  create_normalization_params: false  # Use existing optimized parameters
+  percentiles: [0.0, 100.0]  # Maximum range utilization
+  
+  # Data loading
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  
+  # Image properties
+  image_size: 128
+  channels: 1
+
+# Model configuration
+model:
+  _target_: pkl_dg.models.unet.DenoisingUNet
+  in_channels: 1
+  out_channels: 1
+  model_channels: 128
+  num_res_blocks: 2
+  attention_resolutions: [16, 8]  # Focus on fine details
+  channel_mult: [1, 2, 4, 4]
+  num_heads: 8
+  use_scale_shift_norm: true
+  dropout: 0.1
+  conditioning_dim: 1  # For WF conditioning
+
+# Training configuration optimized for dual objectives
+training:
+  max_epochs: 200  # Longer training for intensity mapping
+  learning_rate: 1e-4  # Conservative for intensity preservation
+  lr_scheduler: "cosine_with_restarts"
+  warmup_steps: 1000
+  gradient_clip_val: 1.0
+  
+  # Mixed precision for efficiency
+  mixed_precision: true
+  
+  # EMA for stability
+  use_ema: true
+  ema_decay: 0.9999
+  
+  # Validation
+  val_check_interval: 0.25  # Check 4 times per epoch
+  val_every_n_epochs: 5
+
+# DDPM configuration
+ddpm:
+  num_timesteps: 1000
+  beta_schedule: "cosine"
+  use_conditioning: true
+  
+  # Enable dual objective loss
+  use_dual_objective_loss: true
+  
+  # Dual objective loss configuration
+  dual_objective_loss:
+    # Loss component weights (optimized for your dual objectives)
+    alpha_diffusion: 1.0    # Standard DDPM loss (spatial structure)
+    beta_intensity: 0.8     # High weight for intensity mapping
+    gamma_perceptual: 0.2   # Spatial quality
+    delta_gradient: 0.5     # Edge preservation (important for sharpness)
+    
+    # Loss types
+    intensity_loss_type: "mse"        # MSE for intensity accuracy
+    gradient_loss_type: "l1"          # L1 for edge preservation
+    intensity_weight_mode: "adaptive" # Higher weight for rare intensities
+    
+    # Adaptive weighting
+    use_adaptive_weighting: true
+    warmup_steps: 1000  # Gradually increase intensity loss weight
+    
+    # Optional perceptual loss (disable if torchvision not available)
+    use_perceptual_loss: false
+
+# Optimization configuration
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: ${training.learning_rate}
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+# Scheduler configuration
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+  T_0: 50
+  T_mult: 2
+  eta_min: 1e-6
+
+# Logging configuration
+logging:
+  # Weights & Biases
+  wandb:
+    mode: "online"  # Set to "disabled" to disable W&B
+    project: "pkl-diffusion-dual-objective"
+    entity: null
+    tags: ${experiment.tags}
+    notes: ${experiment.description}
+  
+  # TensorBoard
+  tensorboard:
+    enabled: true
+    log_dir: "logs/tensorboard"
+  
+  # Logging frequency
+  log_every_n_steps: 50
+  log_images_every_n_epochs: 10
+
+# Checkpointing
+checkpointing:
+  save_top_k: 3
+  monitor: "val/loss"
+  mode: "min"
+  save_last: true
+  filename: "dual-objective-{epoch:02d}-{val_loss:.4f}"
+  
+  # Save directory
+  dirpath: "checkpoints/dual_objective"
+
+# Validation metrics for dual objectives
+validation:
+  metrics:
+    # Spatial quality metrics
+    - "mse"
+    - "psnr" 
+    - "ssim"
+    
+    # Intensity mapping metrics
+    - "intensity_mse"
+    - "intensity_mae"
+    - "histogram_distance"
+    
+    # Sharpness metrics
+    - "gradient_magnitude"
+    - "edge_preservation"
+  
+  # Validation frequency
+  val_samples_to_log: 8
+  log_predictions: true
+
+# Hardware configuration
+hardware:
+  devices: "auto"
+  accelerator: "auto"
+  precision: "16-mixed"  # Mixed precision for efficiency
+  
+  # Memory optimization
+  enable_memory_optimization: true
+  gradient_checkpointing: false  # Disable if memory is sufficient
+
+# Reproducibility
+seed: 42
+
+# Callbacks
+callbacks:
+  # Early stopping
+  early_stopping:
+    monitor: "val/loss"
+    patience: 20
+    mode: "min"
+    
+  # Learning rate monitoring
+  lr_monitor:
+    logging_interval: "step"
+    
+  # Model checkpointing
+  model_checkpoint:
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 3
+    save_last: true

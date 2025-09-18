@@ -18,13 +18,12 @@ def run_training(config):
     return trainer
 
 
+# Import shared test utilities  
+from .test_utils import make_tiny_dataset
+
 def _make_tiny_dataset(root: Path, num_images: int = 4, size: int = 32):
-    for split in ["train", "val"]:
-        split_dir = root / split
-        split_dir.mkdir(parents=True, exist_ok=True)
-        for i in range(num_images):
-            arr = (np.random.rand(size, size) * 255).astype(np.uint8)
-            Image.fromarray(arr).save(split_dir / f"img_{i}.png")
+    """Wrapper to maintain the size=32 parameter for this specific test."""
+    make_tiny_dataset(root, num_images, size)
 
 
 @pytest.mark.cpu

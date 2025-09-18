@@ -1,12 +1,14 @@
 import torch
 
 from pkl_dg.guidance import PKLGuidance, L2Guidance, AnscombeGuidance, AdaptiveSchedule
-from pkl_dg.physics.forward_model import ForwardModel
+from pkl_dg.physics import ForwardModel
 
 
-def _make_forward_model(device: str = "cpu") -> ForwardModel:
-    psf = torch.ones(9, 9) / 81.0
-    return ForwardModel(psf=psf, background=0.2, device=device)
+# Import shared test utilities
+from tests.test_utils import make_forward_model
+
+# Use lambda to avoid redundant function definition
+_make_forward_model = lambda device="cpu": make_forward_model(device=device, background=0.2)
 
 
 def test_pkl_guidance_shapes_and_sign():

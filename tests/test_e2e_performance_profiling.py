@@ -28,9 +28,8 @@ from pkl_dg.models.sampler import DDIMSampler
 from pkl_dg.models.diffusion import DDPMTrainer
 from pkl_dg.models.unet import UNet
 from pkl_dg.guidance import PKLGuidance, L2Guidance, AnscombeGuidance, AdaptiveSchedule
-from pkl_dg.physics.forward_model import ForwardModel
-from pkl_dg.physics.psf import PSF
-from pkl_dg.data import IntensityToModel, SynthesisDataset
+from pkl_dg.physics import ForwardModel, PSF
+from pkl_dg.data import IntensityToModel, RealPairsDataset
 
 
 @dataclass

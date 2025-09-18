@@ -17,13 +17,8 @@ def run_training(config):
     return trainer
 
 
-def _make_tiny_dataset(root: Path, num_images: int = 4, size: int = 16):
-    for split in ["train", "val"]:
-        split_dir = root / split
-        split_dir.mkdir(parents=True, exist_ok=True)
-        for i in range(num_images):
-            arr = (np.random.rand(size, size) * 255).astype(np.uint8)
-            Image.fromarray(arr).save(split_dir / f"img_{i}.png")
+# Import shared test utilities
+from tests.test_utils import make_tiny_dataset as _make_tiny_dataset
 
 
 @pytest.mark.cpu

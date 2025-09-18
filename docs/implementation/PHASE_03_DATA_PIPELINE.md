@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 class SynthesisDataset(Dataset):
-    """Dataset for synthesizing training pairs from ImageNet-like sources."""
+    """Dataset for synthesizing training pairs from external image sources."""
     
     def __init__(
         self,

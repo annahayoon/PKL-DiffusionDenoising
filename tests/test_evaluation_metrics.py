@@ -6,7 +6,7 @@ from pathlib import Path
 # Import Metrics class directly from the .py file (not the directory)
 spec = importlib.util.spec_from_file_location(
     "metrics_module", 
-    Path(__file__).parent.parent / "pkl_dg" / "evaluation" / "metrics.py"
+    Path(__file__).parent.parent / "pkl_dg" / "metrics.py"
 )
 metrics_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(metrics_module)

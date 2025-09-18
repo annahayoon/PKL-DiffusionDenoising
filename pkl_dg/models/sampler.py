@@ -1,7 +1,11 @@
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List, Tuple
 from tqdm import tqdm
+from abc import ABC, abstractmethod
+
+# Import registry system
+from .registry import register_sampler, SAMPLER_REGISTRY
 
 try:
     from einops import rearrange, repeat
@@ -10,8 +14,114 @@ except ImportError:
     EINOPS_AVAILABLE = False
 import warnings
 
+# Import diffusers schedulers with fallback
+try:
+    from diffusers import DDPMScheduler, DDIMScheduler, DPMSolverMultistepScheduler
+    DIFFUSERS_SCHEDULERS_AVAILABLE = True
+except (ImportError, RuntimeError, ModuleNotFoundError):
+    DIFFUSERS_SCHEDULERS_AVAILABLE = False
+    # Create placeholder classes to avoid NameError
+    class DDPMScheduler:
+        pass
+    class DDIMScheduler:
+        pass
+    class DPMSolverMultistepScheduler:
+        pass
 
-class DDIMSampler:
+
+class BaseSampler(ABC):
+    """Abstract base class for diffusion samplers."""
+    
+    @abstractmethod
+    def sample(self, *args, **kwargs) -> torch.Tensor:
+        """Generate samples."""
+        pass
+
+
+@register_sampler(
+    name="ddpm",
+    aliases=["ddpm_sampler", "ancestral"],
+    dependencies=["diffusers"]
+)
+class DDPMSampler(BaseSampler):
+    """DDPM sampler for standard reverse diffusion."""
+    
+    def __init__(self, model: nn.Module, scheduler: DDPMScheduler):
+        if not DIFFUSERS_SCHEDULERS_AVAILABLE:
+            raise ImportError("diffusers package is required for DDPMSampler. Please install with: pip install diffusers")
+        self.model = model
+        self.scheduler = scheduler
+        
+    @torch.no_grad()
+    def sample(self, batch_size: int, image_size: Tuple[int, int], device: torch.device, verbose: bool = False) -> torch.Tensor:
+        sample = torch.randn(batch_size, 1, *image_size, device=device)
+        
+        timesteps = reversed(range(self.scheduler.config.num_train_timesteps))
+        if verbose:
+            timesteps = tqdm(timesteps, desc="DDPM Sampling")
+            
+        for t in timesteps:
+            t_tensor = torch.tensor([t], device=device).long()
+            noise_pred = self.model(sample, t_tensor).sample
+            sample = self.scheduler.step(noise_pred, t, sample).prev_sample
+            
+        return sample
+
+
+@register_sampler(
+    name="ancestral",
+    aliases=["ancestral_sampler", "stochastic"],
+    dependencies=["diffusers"]
+)
+class AncestralSampler(BaseSampler):
+    """Ancestral sampling with stochastic noise injection."""
+    
+    def __init__(self, model: nn.Module, scheduler: DDPMScheduler):
+        self.model = model
+        self.scheduler = scheduler
+        
+    @torch.no_grad()
+    def sample(self, batch_size: int, image_size: Tuple[int, int], device: torch.device, verbose: bool = False) -> torch.Tensor:
+        sample = torch.randn(batch_size, 1, *image_size, device=device)
+        
+        timesteps = reversed(range(self.scheduler.config.num_train_timesteps))
+        if verbose:
+            timesteps = tqdm(timesteps, desc="Ancestral Sampling")
+            
+        for t in timesteps:
+            t_tensor = torch.tensor([t], device=device).long()
+            noise_pred = self.model(sample, t_tensor).sample
+            
+            # Ancestral sampling with proper variance calculation
+            alpha_t = self.scheduler.alphas[t]
+            alpha_prod_t = self.scheduler.alphas_cumprod[t]
+            beta_t = self.scheduler.betas[t]
+            
+            pred_original_sample = (sample - (1 - alpha_t) ** 0.5 * noise_pred) / alpha_t ** 0.5
+            
+            if t > 0:
+                alpha_prod_t_prev = self.scheduler.alphas_cumprod[t - 1]
+                variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * beta_t
+                noise = torch.randn_like(sample)
+                sample = pred_original_sample * alpha_prod_t_prev ** 0.5 + variance ** 0.5 * noise
+            else:
+                sample = pred_original_sample
+                
+        return sample
+
+
+@register_sampler(
+    name="ddim",
+    aliases=["ddim_sampler", "deterministic"],
+    config={
+        "num_timesteps": 1000,
+        "ddim_steps": 100,
+        "eta": 0.0,
+        "clip_denoised": True,
+        "v_parameterization": False
+    }
+)
+class DDIMSampler(BaseSampler):
     """DDIM sampler with guidance injection.
     
     Implements the DDIM sampling algorithm with physics-guided corrections.
@@ -35,10 +145,10 @@ class DDIMSampler:
     def __init__(
         self,
         model: nn.Module,  # DDPMTrainer (LightningModule) exposing buffers
-        forward_model: Optional['ForwardModel'] = None,
-        guidance_strategy: Optional['GuidanceStrategy'] = None,
-        schedule: Optional['AdaptiveSchedule'] = None,
-        transform: Optional['IntensityToModel'] = None,
+        forward_model: Optional[Any] = None,
+        guidance_strategy: Optional[Any] = None,
+        schedule: Optional[Any] = None,
+        transform: Optional[Any] = None,
         num_timesteps: int = 1000,
         ddim_steps: int = 100,
         eta: float = 0.0,
@@ -323,10 +433,10 @@ class DDIMSampler:
     @classmethod
     def from_ddpm_trainer(
         cls,
-        trainer: 'DDPMTrainer',
-        forward_model: Optional['ForwardModel'] = None,
-        guidance_strategy: Optional['GuidanceStrategy'] = None,
-        schedule: Optional['AdaptiveSchedule'] = None,
+        trainer: Any,  # DDPMTrainer
+        forward_model: Optional[Any] = None,
+        guidance_strategy: Optional[Any] = None,
+        schedule: Optional[Any] = None,
         ddim_steps: int = 100,
         eta: float = 0.0,
         clip_denoised: bool = True,
@@ -382,3 +492,56 @@ class DDIMSampler:
             return net(x_t, t)
 
 
+# Modern registry-based factory function
+def create_sampler(
+    sampler_type: str,
+    model: nn.Module,
+    **kwargs
+) -> BaseSampler:
+    """Create a sampler using the registry system.
+    
+    Args:
+        sampler_type: Type of sampler to create (name or alias)
+        model: Model to use with the sampler
+        **kwargs: Sampler parameters
+        
+    Returns:
+        Instantiated sampler
+        
+    Examples:
+        >>> sampler = create_sampler("ddim", model, ddim_steps=50, eta=0.0)
+        >>> sampler = create_sampler("ddpm", model, scheduler=scheduler)
+    """
+    kwargs["model"] = model
+    
+    try:
+        return SAMPLER_REGISTRY.create(sampler_type, **kwargs)
+    except KeyError as e:
+        # Provide helpful error message
+        available = SAMPLER_REGISTRY.list_components()
+        aliases = SAMPLER_REGISTRY.list_aliases()
+        all_names = available + list(aliases.keys())
+        raise ValueError(f"Unknown sampler type: {sampler_type}. Available: {all_names}") from e
+
+
+def get_default_sampler_config() -> Dict[str, Any]:
+    """Get default sampler configuration."""
+    return {
+        "type": "ddim",
+        "num_timesteps": 1000,
+        "ddim_steps": 100,
+        "eta": 0.0,
+        "use_autocast": False,
+        "clip_denoised": True,
+        "v_parameterization": False,
+    }
+
+
+__all__ = [
+    "BaseSampler",
+    "DDIMSampler", 
+    "DDPMSampler",
+    "AncestralSampler",
+    "create_sampler",
+    "get_default_sampler_config",
+]

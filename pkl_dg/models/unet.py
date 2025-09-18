@@ -28,15 +28,13 @@ attention_block = SelfAttention2D
 
 
 class UNet(nn.Module):
-    """Unified UNet supporting both diffusion and supervised modes for microscopy image enhancement.
+    """Diffusion UNet for microscopy image denoising research.
     
-    Modes:
-    - 'diffusion': Self-supervised diffusion denoising with timestep conditioning
-    - 'supervised': Direct WF→2P mapping for supervised baselines
+    Pure diffusion model with timestep conditioning for self-supervised learning.
     
     Designed for:
     - 16-bit grayscale microscopy images (0-65535 range)
-    - WF (wide-field) and 2P (two-photon) image pairs
+    - Physics-guided diffusion denoising
     - Single channel input/output (grayscale)
     """
     
@@ -53,26 +51,19 @@ class UNet(nn.Module):
         self.num_attention_heads = config.get("num_attention_heads", 8)
         self.dropout = config.get("dropout", NNDefaults.DROPOUT_RATE)
         
-        # Mode configuration: 'diffusion' or 'supervised'
-        self.mode = config.get("mode", "diffusion")
-        self.use_time_conditioning = self.mode == "diffusion"
-        
-        if self.mode not in ["diffusion", "supervised"]:
-            raise ValueError(f"Invalid mode '{self.mode}'. Must be 'diffusion' or 'supervised'.")
+        # Pure diffusion mode only
+        self.mode = "diffusion"
+        self.use_time_conditioning = True
         
         # Input channels (no PSF conditioning)
         actual_in_channels = self.in_channels
         
-        # Time embedding (only for diffusion mode)
-        if self.use_time_conditioning:
-            self.time_embedding = TimeEmbeddingMLP(
-                time_dim=self.block_out_channels[0],
-                emb_dim=self.block_out_channels[0] * NNDefaults.TIME_EMB_MULT,
-            )
-            time_emb_dim = self.time_embedding.mlp[-1].out_features
-        else:
-            self.time_embedding = None
-            time_emb_dim = None
+        # Time embedding (required for diffusion)
+        self.time_embedding = TimeEmbeddingMLP(
+            time_dim=self.block_out_channels[0],
+            emb_dim=self.block_out_channels[0] * NNDefaults.TIME_EMB_MULT,
+        )
+        time_emb_dim = self.time_embedding.mlp[-1].out_features
         
         # Input projection
         self.conv_in = nn.Conv2d(actual_in_channels, self.block_out_channels[0], 3, padding=1)
@@ -84,69 +75,37 @@ class UNet(nn.Module):
         
         in_ch = self.block_out_channels[0]
         
-        if self.mode == "supervised":
-            # Supervised mode: Use DoubleConv blocks, no time conditioning
-            for i, out_ch in enumerate(self.block_out_channels):
-                if i == 0:
-                    # First encoder uses input channels
-                    encoder = DoubleConvBlock(in_ch, out_ch, dropout=self.dropout)
-                else:
-                    encoder = DoubleConvBlock(in_ch, out_ch, dropout=self.dropout)
-                self.down_blocks.append(encoder)
-                
-                # Attention at specified resolutions
-                current_resolution = self.sample_size // (2 ** i)
-                if current_resolution in self.attention_resolutions:
-                    self.down_attentions.append(SelfAttention2D(out_ch, self.num_attention_heads))
-                else:
-                    self.down_attentions.append(nn.Identity())
-                
-                # Downsampling (except for last layer)
-                if i < len(self.block_out_channels) - 1:
-                    self.down_samples.append(Downsample(out_ch, method="conv"))
-                else:
-                    self.down_samples.append(nn.Identity())
-                    
-                in_ch = out_ch
-        else:
-            # Diffusion mode: Use ResNet blocks with time conditioning
-            for i, out_ch in enumerate(self.block_out_channels[1:]):
-                # ResNet blocks using standardized component
-                blocks = nn.ModuleList([
-                    ResNetBlock(
-                        in_ch if j == 0 else out_ch, 
-                        out_ch, 
-                        time_emb_dim=time_emb_dim,
-                        dropout=self.dropout
-                    )
-                    for j in range(self.layers_per_block)
-                ])
-                self.down_blocks.append(blocks)
-                
-                # Attention using standardized component
-                current_resolution = self.sample_size // (2 ** (i + 1))
-                if current_resolution in self.attention_resolutions:
-                    self.down_attentions.append(SelfAttention2D(out_ch, self.num_attention_heads))
-                else:
-                    self.down_attentions.append(nn.Identity())
-                
-                # Downsampling using standardized component
-                self.down_samples.append(Downsample(out_ch, method="conv"))
-                in_ch = out_ch
+        # Diffusion mode: ResNet blocks with time conditioning
+        for i, out_ch in enumerate(self.block_out_channels[1:]):
+            # ResNet blocks using standardized component
+            blocks = nn.ModuleList([
+                ResNetBlock(
+                    in_ch if j == 0 else out_ch, 
+                    out_ch, 
+                    time_emb_dim=time_emb_dim,
+                    dropout=self.dropout
+                )
+                for j in range(self.layers_per_block)
+            ])
+            self.down_blocks.append(blocks)
+            
+            # Attention using standardized component
+            current_resolution = self.sample_size // (2 ** (i + 1))
+            if current_resolution in self.attention_resolutions:
+                self.down_attentions.append(SelfAttention2D(out_ch, self.num_attention_heads))
+            else:
+                self.down_attentions.append(nn.Identity())
+            
+            # Downsampling using standardized component
+            self.down_samples.append(Downsample(out_ch, method="conv"))
+            in_ch = out_ch
             
         
-        # Middle blocks
+        # Middle blocks - ResNet blocks with time conditioning
         mid_ch = self.block_out_channels[-1]
-        if self.mode == "supervised":
-            # Supervised mode: no explicit middle blocks (handled by encoder/decoder)
-            self.mid_block1 = None
-            self.mid_attn = None
-            self.mid_block2 = None
-        else:
-            # Diffusion mode: ResNet blocks with time conditioning
-            self.mid_block1 = ResNetBlock(mid_ch, mid_ch, time_emb_dim=time_emb_dim, dropout=self.dropout)
-            self.mid_attn = SelfAttention2D(mid_ch, self.num_attention_heads)
-            self.mid_block2 = ResNetBlock(mid_ch, mid_ch, time_emb_dim=time_emb_dim, dropout=self.dropout)
+        self.mid_block1 = ResNetBlock(mid_ch, mid_ch, time_emb_dim=time_emb_dim, dropout=self.dropout)
+        self.mid_attn = SelfAttention2D(mid_ch, self.num_attention_heads)
+        self.mid_block2 = ResNetBlock(mid_ch, mid_ch, time_emb_dim=time_emb_dim, dropout=self.dropout)
         
         # Up path
         self.up_blocks = nn.ModuleList()
@@ -205,14 +164,9 @@ class UNet(nn.Module):
                 else:
                     self.up_attentions.append(nn.Identity())
         
-        # Output projection
+        # Output projection - zero-initialized conv for diffusion
         self.conv_norm_out = get_normalization("groupnorm", self.block_out_channels[0])
-        if self.mode == "supervised":
-            # Supervised mode: regular conv
-            self.conv_out = nn.Conv2d(self.block_out_channels[0], self.out_channels, 3, padding=1)
-        else:
-            # Diffusion mode: zero-initialized conv
-            self.conv_out = ZeroConv2d(self.block_out_channels[0], self.out_channels, 3, padding=1)
+        self.conv_out = ZeroConv2d(self.block_out_channels[0], self.out_channels, 3, padding=1)
         
         # Memory optimization settings
         self.gradient_checkpointing = config.get("gradient_checkpointing", False)
@@ -255,13 +209,13 @@ class UNet(nn.Module):
         """Denormalize model output back to 16-bit range [0, 65535]."""
         return denormalize_model_output_to_16bit(x)
     
-    def forward(self, x: torch.Tensor, t: Optional[torch.Tensor] = None, 
+    def forward(self, x: torch.Tensor, t: torch.Tensor, 
                 normalize_input: bool = True, denormalize_output: bool = False) -> torch.Tensor:
         """Forward pass with optional 16-bit normalization.
         
         Args:
             x: Input tensor [B, C, H, W] - expected in 16-bit range [0, 65535] if normalize_input=True
-            t: Timestep tensor [B] - required for diffusion mode, ignored for supervised mode
+            t: Timestep tensor [B] - required for diffusion
             normalize_input: Whether to normalize 16-bit input to [-1, 1]
             denormalize_output: Whether to denormalize output back to [0, 65535]
             

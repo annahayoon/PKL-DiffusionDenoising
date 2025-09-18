@@ -118,7 +118,7 @@ def run_inference(config):
     return output_files
 
 from pkl_dg.guidance import PKLGuidance, L2Guidance, AnscombeGuidance, AdaptiveSchedule
-from pkl_dg.data import SynthesisDataset, IntensityToModel
+from pkl_dg.data import RealPairsDataset, IntensityToModel
 from pkl_dg.physics import ForwardModel, PSF
 
 # Mock metrics for now since the import is broken
@@ -268,8 +268,8 @@ class E2EPipelineTestBase:
             image += np.random.normal(0, 10, image.shape)
             image = np.clip(image, 0, 255).astype(np.uint8)
             
-            # Save as PNG for training data
-            img_path = output_dir / f"test_image_{i:03d}.png"
+            # Save as TIFF for RealPairsDataset compatibility
+            img_path = output_dir / f"test_image_{i:03d}.tif"
             Image.fromarray(image).save(str(img_path))
             image_paths.append(img_path)
         
@@ -299,12 +299,34 @@ class TestDataPipeline(E2EPipelineTestBase):
     
     def test_synthetic_data_creation(self, temp_workspace, minimal_config):
         """Test synthetic training data creation."""
-        # Create source images
-        train_dir = temp_workspace / "data" / "train" / "classless"
-        val_dir = temp_workspace / "data" / "val" / "classless"
+        # Create proper directory structure for RealPairsDataset
+        data_root = temp_workspace / "data"
         
-        train_images = self.create_synthetic_images(train_dir, num_images=10)
-        val_images = self.create_synthetic_images(val_dir, num_images=5)
+        # Create train directories
+        train_wf_dir = data_root / "train" / "wf"
+        train_2p_dir = data_root / "train" / "2p"
+        train_wf_dir.mkdir(parents=True, exist_ok=True)
+        train_2p_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create val directories  
+        val_wf_dir = data_root / "val" / "wf"
+        val_2p_dir = data_root / "val" / "2p"
+        val_wf_dir.mkdir(parents=True, exist_ok=True)
+        val_2p_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create synthetic image pairs
+        train_images = self.create_synthetic_images(train_2p_dir, num_images=10)
+        # Copy to wf dir (simulating paired data)
+        for img_path in train_images:
+            wf_path = train_wf_dir / img_path.name
+            import shutil
+            shutil.copy2(img_path, wf_path)
+            
+        val_images = self.create_synthetic_images(val_2p_dir, num_images=5)
+        # Copy to wf dir (simulating paired data)
+        for img_path in val_images:
+            wf_path = val_wf_dir / img_path.name
+            shutil.copy2(img_path, wf_path)
         
         # Test dataset creation
         psf = PSF()
@@ -319,17 +341,18 @@ class TestDataPipeline(E2EPipelineTestBase):
             max_intensity=minimal_config.data.max_intensity
         )
         
-        train_dataset = SynthesisDataset(
-            source_dir=str(train_dir),
-            forward_model=forward_model,
+        # Use RealPairsDataset with proper structure
+        train_dataset = RealPairsDataset(
+            data_dir=str(data_root),
+            split="train",
             transform=transform,
             image_size=minimal_config.data.image_size,
             mode="train"
         )
         
-        val_dataset = SynthesisDataset(
-            source_dir=str(val_dir),
-            forward_model=forward_model,
+        val_dataset = RealPairsDataset(
+            data_dir=str(data_root),
+            split="val", 
             transform=transform,
             image_size=minimal_config.data.image_size,
             mode="val"

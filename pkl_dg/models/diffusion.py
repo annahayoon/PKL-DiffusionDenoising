@@ -7,6 +7,30 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 
 from .nn import NNDefaults, get_activation
+from .dual_objective_loss import DualObjectiveLoss, create_dual_objective_loss
+
+# Import dataset from data module
+try:
+    from ..data import UnpairedDataset
+    UNPAIRED_DATASET_AVAILABLE = True
+except ImportError:
+    UnpairedDataset = None
+    UNPAIRED_DATASET_AVAILABLE = False
+
+# Import advanced components for SOTA integration
+try:
+    from .progressive import ProgressiveTrainer, ProgressiveUNet
+    from .hierarchical_strategy import HierarchicalTrainer, HierarchicalSampler
+    from .cascaded_sampling import CascadedSampler, create_cascaded_sampler
+    from .losses import create_frequency_loss, get_frequency_loss_config
+    from .advanced_schedulers import create_scheduler, get_scheduler_config, SchedulerManager
+    from ..utils.utils import AdaptiveBatchSizer, create_adaptive_dataloader
+    SOTA_FEATURES_AVAILABLE = True
+except ImportError:
+    # Fallback when SOTA features are not available
+    SOTA_FEATURES_AVAILABLE = False
+    ProgressiveTrainer = None
+    HierarchicalTrainer = None
 
 # Import diffusers schedulers with fallback
 try:
@@ -37,298 +61,14 @@ except Exception:  # pragma: no cover - fallback when lightning is unavailable
             return getattr(self, "_global_step", 0)
 
 
-class CycleConsistencyLoss(nn.Module):
-    """Cycle consistency loss for self-supervised training."""
-    
-    def __init__(self, loss_type: str = "l1", reduction: str = "mean"):
-        """
-        Initialize cycle consistency loss.
-        
-        Args:
-            loss_type: Type of loss ('l1', 'l2', 'smooth_l1')
-            reduction: Reduction method ('mean', 'sum', 'none')
-        """
-        super().__init__()
-        self.loss_type = loss_type.lower()
-        self.reduction = reduction
-        
-    def forward(self, original: torch.Tensor, reconstructed: torch.Tensor) -> torch.Tensor:
-        """
-        Compute cycle consistency loss.
-        
-        Args:
-            original: Original image [B, C, H, W]
-            reconstructed: Reconstructed image from forward cycle [B, C, H, W]
-            
-        Returns:
-            Cycle consistency loss
-        """
-        if self.loss_type == "l1":
-            loss = F.l1_loss(reconstructed, original, reduction=self.reduction)
-        elif self.loss_type == "l2":
-            loss = F.mse_loss(reconstructed, original, reduction=self.reduction)
-        elif self.loss_type == "smooth_l1":
-            loss = F.smooth_l1_loss(reconstructed, original, reduction=self.reduction)
-        else:
-            raise ValueError(f"Unsupported loss type: {self.loss_type}")
-            
-        return loss
-
-
-class PerceptualLoss(nn.Module):
-    """Perceptual loss using pre-trained features for better image quality."""
-    
-    def __init__(self, feature_layers: Optional[list] = None, use_pretrained: bool = False):
-        """
-        Initialize perceptual loss.
-        
-        Args:
-            feature_layers: List of layer indices to extract features from
-            use_pretrained: Whether to use pretrained VGG features (for natural images)
-        """
-        super().__init__()
-        self.feature_layers = feature_layers or [0, 1, 2, 3]
-        self.use_pretrained = use_pretrained
-        
-        if use_pretrained:
-            # Use VGG for natural images
-            try:
-                import torchvision.models as models
-                vgg = models.vgg16(pretrained=True).features
-                self.feature_extractor = nn.ModuleList([
-                    vgg[:4],   # conv1_2
-                    vgg[:9],   # conv2_2
-                    vgg[:16],  # conv3_3
-                    vgg[:23],  # conv4_3
-                ])
-                # Freeze VGG features
-                for param in self.feature_extractor.parameters():
-                    param.requires_grad = False
-            except ImportError:
-                print("⚠️ torchvision not available, using simple conv features")
-                self.use_pretrained = False
-                self._init_simple_features()
-        else:
-            # Simple conv layers for microscopy or when torchvision unavailable
-            self._init_simple_features()
-    
-    def _init_simple_features(self):
-        """Initialize simple convolutional features using standardized components."""
-        from .nn import ConvBlock
-        
-        channels = [32, 64, 128, 256]
-        layers = []
-        in_ch = 1
-        
-        for out_ch in channels:
-            layers.append(ConvBlock(
-                in_ch, out_ch,
-                norm_type="groupnorm",
-                activation="relu",  # Use ReLU for feature extraction
-                dropout=0.0
-            ))
-            in_ch = out_ch
-        
-        self.feature_extractor = nn.ModuleList(layers)
-        
-        # Freeze feature extractor
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = False
-    
-    def extract_features(self, x: torch.Tensor) -> list:
-        """Extract multi-scale features."""
-        features = []
-        
-        if self.use_pretrained:
-            # VGG features for natural images (expects 3 channels)
-            if x.shape[1] == 1:
-                x = x.repeat(1, 3, 1, 1)  # Convert grayscale to RGB
-            
-            for i, layer in enumerate(self.feature_extractor):
-                x = layer(x)
-                if i in self.feature_layers:
-                    features.append(x)
-        else:
-            # Simple conv features using standardized blocks
-            for i, layer in enumerate(self.feature_extractor):
-                x = layer(x)  # ConvBlock already includes activation
-                if i in self.feature_layers:
-                    features.append(x)
-                if i < len(self.feature_extractor) - 1:
-                    x = F.avg_pool2d(x, 2)
-        
-        return features
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute perceptual loss."""
-        pred_features = self.extract_features(pred)
-        target_features = self.extract_features(target)
-        
-        loss = 0
-        for pred_feat, target_feat in zip(pred_features, target_features):
-            loss += F.mse_loss(pred_feat, target_feat)
-        
-        return loss / len(pred_features)
-
-
-class UnpairedDataset(torch.utils.data.Dataset):
-    """Dataset for self-supervised training using forward model or unpaired data."""
-    
-    def __init__(
-        self,
-        wf_dir: str,
-        twop_dir: str,
-        transform: Optional[Any] = None,
-        image_size: int = 256,
-        mode: str = "train",
-        forward_model: Optional[Any] = None,
-        use_forward_model: bool = True,
-        add_noise: bool = True,
-        noise_level: float = 0.05
-    ):
-        """
-        Initialize dataset for self-supervised learning.
-        
-        Args:
-            wf_dir: Directory containing WF images (used for evaluation/paired mode)
-            twop_dir: Directory containing 2P images (ground truth)
-            transform: Data transform
-            image_size: Target image size
-            mode: Dataset mode ('train', 'val', 'test')
-            forward_model: Forward model for generating synthetic WF from 2P
-            use_forward_model: If True, use forward model; if False, use unpaired WF/2P
-            add_noise: Whether to add noise to synthetic WF (only for forward model mode)
-            noise_level: Standard deviation of additive noise
-        """
-        from pathlib import Path
-        from PIL import Image
-        
-        self.wf_dir = Path(wf_dir)
-        self.twop_dir = Path(twop_dir)
-        self.transform = transform
-        self.image_size = image_size
-        self.mode = mode
-        self.forward_model = forward_model
-        self.use_forward_model = use_forward_model
-        self.add_noise = add_noise
-        self.noise_level = noise_level
-        
-        # Collect image paths
-        patterns = ["**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.tif", "**/*.tiff"]
-        
-        self.wf_paths = []
-        self.twop_paths = []
-        
-        for pattern in patterns:
-            if self.wf_dir.exists():
-                self.wf_paths.extend(list(self.wf_dir.glob(pattern)))
-            self.twop_paths.extend(list(self.twop_dir.glob(pattern)))
-        
-        self.wf_paths = sorted(self.wf_paths)
-        self.twop_paths = sorted(self.twop_paths)
-        
-        if self.use_forward_model:
-            print(f"Found {len(self.twop_paths)} 2P images for self-supervised learning with forward model")
-            if len(self.twop_paths) == 0:
-                raise ValueError(f"No 2P images found in {self.twop_dir}")
-        else:
-            print(f"Found {len(self.wf_paths)} WF images and {len(self.twop_paths)} 2P images for unpaired training")
-        
-    def __len__(self) -> int:
-        if self.use_forward_model:
-            return len(self.twop_paths)
-        else:
-            return max(len(self.wf_paths), len(self.twop_paths))
-    
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get training pair.
-        
-        Returns:
-            Tuple of (target_2P, conditioner_WF) where conditioner_WF is either:
-            - Synthetic WF generated from 2P using forward model (self-supervised)
-            - Real WF image (unpaired/paired mode)
-        """
-        from PIL import Image
-        import numpy as np
-        
-        if self.use_forward_model:
-            # Self-supervised mode: use forward model to generate synthetic WF
-            return self._get_self_supervised_pair(idx)
-        else:
-            # Legacy unpaired mode: randomly pair WF and 2P
-            return self._get_unpaired_pair(idx)
-    
-    def _get_self_supervised_pair(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get self-supervised pair using forward model."""
-        from PIL import Image
-        import numpy as np
-        
-        # Load 2P image (ground truth)
-        twop_path = self.twop_paths[idx]
-        twop_img = Image.open(twop_path).convert('L')
-        twop_img = twop_img.resize((self.image_size, self.image_size), Image.BILINEAR)
-        twop_tensor = torch.from_numpy(np.array(twop_img, dtype=np.float32) / 255.0).unsqueeze(0)
-        
-        # Generate synthetic WF using forward model
-        if self.forward_model is not None:
-            with torch.no_grad():
-                # Move to forward model device
-                device = next(iter(self.forward_model.psf.parameters())).device if hasattr(self.forward_model.psf, 'parameters') else 'cpu'
-                twop_batch = twop_tensor.unsqueeze(0).to(device)
-                
-                # Apply forward model: 2P -> synthetic WF
-                synthetic_wf_batch = self.forward_model.forward(twop_batch, add_noise=self.add_noise)
-                
-                # Add additional noise for robustness during training
-                if self.add_noise and self.noise_level > 0 and self.mode == "train":
-                    noise = torch.randn_like(synthetic_wf_batch) * self.noise_level
-                    synthetic_wf_batch = synthetic_wf_batch + noise
-                
-                synthetic_wf = synthetic_wf_batch.squeeze(0).cpu()
-        else:
-            # Fallback: use original 2P as conditioner (identity mapping)
-            synthetic_wf = twop_tensor.clone()
-        
-        # Ensure tensors are in valid range
-        twop_tensor = torch.clamp(twop_tensor, 0.0, 1.0)
-        synthetic_wf = torch.clamp(synthetic_wf, 0.0, 1.0)
-        
-        # Apply transforms
-        if self.transform is not None:
-            twop_tensor = self.transform(twop_tensor)
-            synthetic_wf = self.transform(synthetic_wf)
-        
-        return twop_tensor, synthetic_wf
-    
-    def _get_unpaired_pair(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get unpaired WF/2P pair (legacy mode)."""
-        from PIL import Image
-        import numpy as np
-        
-        # Randomly sample from each dataset
-        wf_idx = idx % len(self.wf_paths) if len(self.wf_paths) > 0 else 0
-        twop_idx = np.random.randint(0, len(self.twop_paths)) if len(self.twop_paths) > 0 else 0
-        
-        # Load images
-        if len(self.wf_paths) > 0:
-            wf_img = Image.open(self.wf_paths[wf_idx]).convert('L')
-            wf_img = wf_img.resize((self.image_size, self.image_size), Image.BILINEAR)
-            wf_tensor = torch.from_numpy(np.array(wf_img, dtype=np.float32) / 255.0).unsqueeze(0)
-        else:
-            # Fallback if no WF images
-            wf_tensor = torch.zeros(1, self.image_size, self.image_size)
-        
-        twop_img = Image.open(self.twop_paths[twop_idx]).convert('L')
-        twop_img = twop_img.resize((self.image_size, self.image_size), Image.BILINEAR)
-        twop_tensor = torch.from_numpy(np.array(twop_img, dtype=np.float32) / 255.0).unsqueeze(0)
-        
-        # Apply transforms
-        if self.transform is not None:
-            wf_tensor = self.transform(wf_tensor)
-            twop_tensor = self.transform(twop_tensor)
-        
-        return twop_tensor, wf_tensor
+# Import loss functions from losses module
+try:
+    from .losses import CycleConsistencyLoss, PerceptualLoss, create_loss_function
+    LOSSES_AVAILABLE = True
+except ImportError:
+    LOSSES_AVAILABLE = False
+    CycleConsistencyLoss = None
+    PerceptualLoss = None
 
 
 class DDPMTrainer(LightningModuleBase):
@@ -353,9 +93,20 @@ class DDPMTrainer(LightningModuleBase):
         # Self-supervised training mode
         self.self_supervised = config.get("self_supervised", False)
         
+        # Advanced features configuration
+        self.advanced_config = config.get("advanced_features", {})
+        self.enable_frequency_losses = self.advanced_config.get("enable_frequency_losses", False)
+        self.enable_advanced_schedulers = self.advanced_config.get("enable_advanced_schedulers", False)
+        self.enable_memory_optimization = self.advanced_config.get("enable_memory_optimization", False)
+        self.enable_cascaded_sampling = self.advanced_config.get("enable_cascaded_sampling", False)
+        
         # Initialize self-supervised components if enabled
         if self.self_supervised:
             self._init_self_supervised_components()
+        
+        # Initialize advanced components if available and enabled
+        if SOTA_FEATURES_AVAILABLE:
+            self._init_advanced_components()
         
         # Setup noise schedule (diffusers or manual)
         if self.use_diffusers_scheduler:
@@ -395,6 +146,14 @@ class DDPMTrainer(LightningModuleBase):
             self.scaler = GradScaler()
         else:
             self.scaler = None
+        
+        # Initialize dual objective loss if enabled
+        self.use_dual_objective_loss = config.get("use_dual_objective_loss", False)
+        if self.use_dual_objective_loss:
+            self.dual_objective_loss = create_dual_objective_loss(config)
+            print("✅ Dual-objective loss enabled for spatial resolution + intensity mapping")
+        else:
+            self.dual_objective_loss = None
     
     def _init_self_supervised_components(self):
         """Initialize components for self-supervised training."""
@@ -403,7 +162,7 @@ class DDPMTrainer(LightningModuleBase):
             loss_type=self.config.get("cycle_loss_type", "l1")
         )
         
-        # Perceptual loss - use pretrained for natural images
+        # Perceptual loss - configurable pretrained features
         use_pretrained_perceptual = self.config.get("use_pretrained_perceptual", False)
         self.perceptual_loss = PerceptualLoss(
             use_pretrained=use_pretrained_perceptual
@@ -416,6 +175,128 @@ class DDPMTrainer(LightningModuleBase):
         
         # Forward model type
         self.forward_model_type = self.config.get("forward_model_type", "physics")  # 'physics', 'learned', 'identity'
+    
+    def _init_advanced_components(self):
+        """Initialize advanced feature components if available."""
+        # Advanced frequency losses
+        if self.enable_frequency_losses:
+            self._setup_frequency_losses()
+        
+        # Advanced schedulers (beyond diffusers)
+        if self.enable_advanced_schedulers:
+            self._setup_advanced_schedulers()
+        
+        # Memory optimization
+        if self.enable_memory_optimization:
+            self._setup_memory_optimization()
+        
+        # Cascaded sampling support
+        if self.enable_cascaded_sampling:
+            self._setup_cascaded_sampling()
+        
+        # Performance monitoring
+        self.performance_stats = {
+            "memory_usage": [],
+            "training_speed": [],
+            "loss_improvements": [],
+            "batch_adjustments": 0,
+            "scheduler_transitions": 0,
+        }
+        
+        if any([self.enable_frequency_losses, self.enable_advanced_schedulers, 
+                self.enable_memory_optimization, self.enable_cascaded_sampling]):
+            print("🚀 Advanced features enabled:")
+            if self.enable_frequency_losses:
+                print("   ✅ Frequency domain losses")
+            if self.enable_advanced_schedulers:
+                print("   ✅ Advanced schedulers")
+            if self.enable_memory_optimization:
+                print("   ✅ Memory optimization")
+            if self.enable_cascaded_sampling:
+                print("   ✅ Cascaded sampling")
+    
+    def _setup_frequency_losses(self):
+        """Setup advanced frequency domain losses."""
+        freq_config = self.advanced_config.get("frequency_losses", {})
+        
+        # Multi-scale frequency loss
+        self.frequency_loss = create_frequency_loss(
+            loss_type="multi_scale",
+            scales=[1, 2, 4],
+            use_fourier=freq_config.get("use_fourier", True),
+            use_spectral=freq_config.get("use_spectral", True),
+            use_wavelet=freq_config.get("use_wavelet", False),
+            fourier_weight=freq_config.get("fourier_weight", 1.0),
+            spectral_weight=freq_config.get("spectral_weight", 0.5),
+            wavelet_weight=freq_config.get("wavelet_weight", 0.3),
+        )
+        
+        # High-frequency preservation loss
+        self.high_freq_loss = create_frequency_loss(
+            loss_type="high_frequency",
+            high_freq_threshold=freq_config.get("high_freq_threshold", 0.5),
+            emphasis_factor=freq_config.get("emphasis_factor", 2.0),
+        )
+        
+        # Loss weights
+        self.frequency_loss_weight = self.advanced_config.get("frequency_loss_weight", 0.1)
+        self.high_freq_loss_weight = freq_config.get("high_freq_loss_weight", 0.05)
+    
+    def _setup_advanced_schedulers(self):
+        """Setup advanced noise schedulers beyond diffusers."""
+        scheduler_config = self.advanced_config.get("scheduler", {})
+        scheduler_type = scheduler_config.get("type", "improved_cosine")
+        
+        # Create advanced scheduler
+        self.advanced_scheduler = create_scheduler(
+            scheduler_type=scheduler_type,
+            num_timesteps=self.num_timesteps,
+            **scheduler_config.get("params", {})
+        )
+        
+        # Scheduler manager for dynamic switching
+        self.scheduler_manager = SchedulerManager()
+        self.scheduler_manager.add_scheduler("base", self.advanced_scheduler)
+        
+        # Add alternative schedulers for dynamic switching
+        alt_schedulers = scheduler_config.get("alternatives", [])
+        for alt_name, alt_config in alt_schedulers:
+            alt_scheduler = create_scheduler(
+                scheduler_type=alt_config["type"],
+                num_timesteps=self.num_timesteps,
+                **alt_config.get("params", {})
+            )
+            self.scheduler_manager.add_scheduler(alt_name, alt_scheduler)
+    
+    def _setup_memory_optimization(self):
+        """Setup memory optimization components."""
+        memory_config = self.advanced_config.get("memory_optimization", {})
+        
+        # Adaptive batch sizer
+        self.batch_sizer = AdaptiveBatchSizer(
+            safety_factor=memory_config.get("safety_factor", 0.8),
+            enable_dynamic_scaling=memory_config.get("enable_dynamic_scaling", True),
+            memory_pressure_threshold=memory_config.get("memory_pressure_threshold", 0.85),
+            verbose=memory_config.get("verbose", False),
+        )
+        
+        # Memory monitoring
+        self.memory_monitoring_enabled = memory_config.get("enable_monitoring", True)
+    
+    def _setup_cascaded_sampling(self):
+        """Setup cascaded sampling components."""
+        cascaded_config = self.advanced_config.get("cascaded_sampling", {})
+        
+        if cascaded_config.get("enabled", True):
+            # Create cascaded sampler
+            self.cascaded_sampler = create_cascaded_sampler(
+                model=self.model,
+                sampler_type=cascaded_config.get("type", "basic"),
+                resolution_schedule=cascaded_config.get("resolution_schedule", [64, 128, 256, 512]),
+                **cascaded_config.get("params", {})
+            )
+        else:
+            self.cascaded_sampler = None
 
     def _log_if_trainer(self, *args, **kwargs) -> None:
         """Log only if a Lightning Trainer is attached to avoid warnings in tests.
@@ -597,8 +478,9 @@ class DDPMTrainer(LightningModuleBase):
     # ===== DDPM reverse-process utilities (mirroring ddpm.py) =====
     @staticmethod
     def _extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Tensor:
-        """Gather a[t] then reshape to broadcast over x."""
-        out = a.gather(0, t)
+        """Extract a[t] then reshape to broadcast over x - CORRECTED."""
+        # Use direct indexing instead of gather for clarity and consistency
+        out = a[t]
         return out.view(-1, *([1] * (len(x_shape) - 1)))
 
     def predict_start_from_noise(self, x_t: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
@@ -755,17 +637,40 @@ class DDPMTrainer(LightningModuleBase):
                         noise_pred = self.model(x_t, t)
                 else:
                     noise_pred = self.model(x_t, t)
-                loss = F.mse_loss(noise_pred, noise)
                 
-                # Optional supervised x0 loss to encourage paired mapping
-                if self.config.get("supervised_x0_weight", 0.0) > 0:
-                    # Reconstruct x0 from epsilon prediction (epsilon parameterization)
-                    alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
-                    sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
-                    sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
-                    x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
-                    loss_x0 = F.l1_loss(x0_hat, x_0)
-                    loss = loss + float(self.config.get("supervised_x0_weight", 0.0)) * loss_x0
+                # Standard diffusion loss (noise prediction)
+                diffusion_loss = F.mse_loss(noise_pred, noise)
+                
+                # Reconstruct x0 for dual objective loss
+                alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+                sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
+                sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
+                x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                
+                # Apply dual objective loss if enabled
+                if self.use_dual_objective_loss:
+                    loss_components = self.dual_objective_loss(
+                        diffusion_loss=diffusion_loss,
+                        pred_x0=x0_hat,
+                        target_x0=x_0,
+                        step=self.global_step
+                    )
+                    loss = loss_components['total_loss']
+                    
+                    # Log individual loss components
+                    self._log_if_trainer("train/diffusion_loss", loss_components['diffusion_loss'])
+                    self._log_if_trainer("train/intensity_loss", loss_components['intensity_loss'])
+                    self._log_if_trainer("train/gradient_loss", loss_components['gradient_loss'])
+                    self._log_if_trainer("train/perceptual_loss", loss_components['perceptual_loss'])
+                    
+                else:
+                    loss = diffusion_loss
+                    
+                    # Optional supervised x0 loss to encourage paired mapping
+                    if self.config.get("supervised_x0_weight", 0.0) > 0:
+                        loss_x0 = F.l1_loss(x0_hat, x_0)
+                        loss = loss + float(self.config.get("supervised_x0_weight", 0.0)) * loss_x0
+                        
         else:
             # Standard precision training
             if use_conditioning:
@@ -775,17 +680,60 @@ class DDPMTrainer(LightningModuleBase):
                     noise_pred = self.model(x_t, t)
             else:
                 noise_pred = self.model(x_t, t)
-            loss = F.mse_loss(noise_pred, noise)
             
-            # Optional supervised x0 loss to encourage paired mapping
-            if self.config.get("supervised_x0_weight", 0.0) > 0:
-                # Reconstruct x0 from epsilon prediction (epsilon parameterization)
-                alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
-                sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
-                sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
-                x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
-                loss_x0 = F.l1_loss(x0_hat, x_0)
-                loss = loss + float(self.config.get("supervised_x0_weight", 0.0)) * loss_x0
+            # Standard diffusion loss (noise prediction)
+            diffusion_loss = F.mse_loss(noise_pred, noise)
+            
+            # Reconstruct x0 for dual objective loss
+            alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+            sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
+            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
+            x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+            
+            # Apply dual objective loss if enabled
+            if self.use_dual_objective_loss:
+                loss_components = self.dual_objective_loss(
+                    diffusion_loss=diffusion_loss,
+                    pred_x0=x0_hat,
+                    target_x0=x_0,
+                    step=self.global_step
+                )
+                loss = loss_components['total_loss']
+                
+                # Log individual loss components
+                self._log_if_trainer("train/diffusion_loss", loss_components['diffusion_loss'])
+                self._log_if_trainer("train/intensity_loss", loss_components['intensity_loss'])
+                self._log_if_trainer("train/gradient_loss", loss_components['gradient_loss'])
+                self._log_if_trainer("train/perceptual_loss", loss_components['perceptual_loss'])
+                
+            else:
+                loss = diffusion_loss
+                
+                # Optional supervised x0 loss to encourage paired mapping
+                if self.config.get("supervised_x0_weight", 0.0) > 0:
+                    loss_x0 = F.l1_loss(x0_hat, x_0)
+                    loss = loss + float(self.config.get("supervised_x0_weight", 0.0)) * loss_x0
+        
+        # Add frequency domain losses if enabled
+        if SOTA_FEATURES_AVAILABLE and self.enable_frequency_losses:
+            freq_loss = self._compute_frequency_losses(batch)
+            loss = loss + freq_loss
+        
+        # Advanced features monitoring and optimization
+        if SOTA_FEATURES_AVAILABLE and hasattr(self, 'performance_stats'):
+            # Monitor memory if enabled
+            if self.enable_memory_optimization and batch_idx % 50 == 0:
+                self._monitor_memory_usage()
+            
+            # Update performance stats
+            self.performance_stats["loss_improvements"].append(loss.item())
+            
+            # Dynamic batch size adjustment
+            if self.enable_memory_optimization and batch_idx % 100 == 0:
+                self._check_batch_size_adjustment(batch_idx)
+            
+            # Log advanced feature metrics
+            self._log_advanced_metrics(batch_idx, loss)
         
         self._log_if_trainer("train/loss", loss, prog_bar=True)
         if self.use_ema and self.global_step % 10 == 0:
@@ -1220,6 +1168,7 @@ class DDPMTrainer(LightningModuleBase):
         # Handle 16-bit output if requested
         if return_16bit or save_path:
             # Convert to 16-bit using the transform
+            from ..utils.image_processing import to_uint16_grayscale, save_16bit_grayscale
             output_16bit = to_uint16_grayscale(x_t, transform=self.transform)
             
             if save_path:
@@ -1246,7 +1195,7 @@ class DDPMTrainer(LightningModuleBase):
             Dictionary with recommended batch size and settings
         """
         try:
-            from ..utils.adaptive_batch import AdaptiveBatchSizer
+            from ..utils.utils import AdaptiveBatchSizer
             
             batch_sizer = AdaptiveBatchSizer(verbose=True)
             config = batch_sizer.get_recommended_config(
@@ -1412,157 +1361,335 @@ class DDPMTrainer(LightningModuleBase):
             })
         
         return info
+    
+    def _compute_frequency_losses(self, batch) -> torch.Tensor:
+        """Compute frequency domain losses."""
+        if isinstance(batch, (list, tuple)):
+            x_0, c_wf = batch
+        else:
+            x_0 = batch
+            c_wf = None
+        
+        total_freq_loss = 0.0
+        
+        # Generate prediction for frequency analysis
+        with torch.no_grad():
+            # Sample timestep and noise
+            t = torch.randint(0, self.num_timesteps, (x_0.shape[0],), device=x_0.device)
+            noise = torch.randn_like(x_0)
+            x_t = self.q_sample(x_0, t, noise)
+            
+            # Get prediction
+            if self.mixed_precision and torch.cuda.is_available():
+                with torch.cuda.amp.autocast(dtype=self.autocast_dtype):
+                    noise_pred = self.model(x_t, t, cond=c_wf) if c_wf is not None else self.model(x_t, t)
+            else:
+                noise_pred = self.model(x_t, t, cond=c_wf) if c_wf is not None else self.model(x_t, t)
+            
+            # Predict x0
+            alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+            sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
+            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
+            x0_pred = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+            x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+        
+        # Multi-scale frequency loss
+        if hasattr(self, 'frequency_loss'):
+            freq_loss = self.frequency_loss(x0_pred, x_0)
+            total_freq_loss += self.frequency_loss_weight * freq_loss
+            self._log_if_trainer("train/frequency_loss", freq_loss)
+        
+        # High-frequency preservation loss
+        if hasattr(self, 'high_freq_loss'):
+            high_freq_loss = self.high_freq_loss(x0_pred, x_0)
+            total_freq_loss += self.high_freq_loss_weight * high_freq_loss
+            self._log_if_trainer("train/high_freq_loss", high_freq_loss)
+        
+        return total_freq_loss
+    
+    def _monitor_memory_usage(self):
+        """Monitor memory usage and update stats."""
+        if not torch.cuda.is_available():
+            return
+        
+        memory_info = {
+            "allocated_gb": torch.cuda.memory_allocated() / 1e9,
+            "reserved_gb": torch.cuda.memory_reserved() / 1e9,
+            "max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+        }
+        
+        if hasattr(self, 'performance_stats'):
+            self.performance_stats["memory_usage"].append(memory_info)
+            
+            # Keep only recent history
+            if len(self.performance_stats["memory_usage"]) > 1000:
+                self.performance_stats["memory_usage"] = self.performance_stats["memory_usage"][-1000:]
+        
+        # Log memory stats
+        self._log_if_trainer("memory/allocated_gb", memory_info["allocated_gb"])
+        self._log_if_trainer("memory/reserved_gb", memory_info["reserved_gb"])
+    
+    def _check_batch_size_adjustment(self, step: int):
+        """Check if batch size needs adjustment."""
+        if not hasattr(self, 'batch_sizer'):
+            return
+        
+        # Get current batch size (from dataloader or config)
+        current_batch_size = self.config.get("training", {}).get("batch_size", 8)
+        
+        # Check for adjustment
+        loss_val = self.performance_stats["loss_improvements"][-1] if self.performance_stats["loss_improvements"] else None
+        new_batch_size, adjustment_info = self.batch_sizer.adjust_batch_size_dynamically(
+            current_batch_size=current_batch_size,
+            step=step,
+            loss=loss_val,
+        )
+        
+        if adjustment_info["adjusted"]:
+            self.performance_stats["batch_adjustments"] += 1
+            print(f"🔄 Batch size adjusted at step {step}: {adjustment_info['old_batch_size']} → {adjustment_info['new_batch_size']}")
+            
+            # Update config (for logging)
+            if "training" not in self.config:
+                self.config["training"] = {}
+            self.config["training"]["batch_size"] = new_batch_size
+    
+    def _log_advanced_metrics(self, batch_idx: int, loss: torch.Tensor):
+        """Log advanced feature metrics."""
+        if not hasattr(self, 'performance_stats'):
+            return
+        
+        # Memory metrics
+        if self.enable_memory_optimization and batch_idx % 100 == 0:
+            if hasattr(self, 'batch_sizer'):
+                summary = self.batch_sizer.get_performance_summary()
+                self._log_if_trainer("advanced/current_batch_size", summary.get("current_batch_size", 0))
+                self._log_if_trainer("advanced/memory_pressure", summary.get("current_memory_pressure", 0))
+        
+        # Performance metrics
+        self._log_if_trainer("advanced/total_batch_adjustments", self.performance_stats["batch_adjustments"])
+        self._log_if_trainer("advanced/scheduler_transitions", self.performance_stats["scheduler_transitions"])
+    
+    def get_advanced_features_summary(self) -> Dict[str, Any]:
+        """Get comprehensive summary of advanced features and performance."""
+        if not SOTA_FEATURES_AVAILABLE or not hasattr(self, 'performance_stats'):
+            return {"advanced_features_available": False}
+        
+        summary = {
+            "advanced_features_available": True,
+            "advanced_features_enabled": {
+                "frequency_losses": self.enable_frequency_losses,
+                "advanced_schedulers": self.enable_advanced_schedulers,
+                "memory_optimization": self.enable_memory_optimization,
+                "cascaded_sampling": self.enable_cascaded_sampling,
+            },
+            "performance_stats": self.performance_stats.copy() if hasattr(self, 'performance_stats') else {},
+        }
+        
+        # Add memory optimization summary
+        if hasattr(self, 'batch_sizer'):
+            summary["memory_optimization"] = self.batch_sizer.get_performance_summary()
+        
+        return summary
+    
+    @torch.no_grad()
+    def enhanced_inference(
+        self,
+        x_source: torch.Tensor,
+        inference_type: str = "cascaded",
+        num_inference_steps: int = 50,
+        **kwargs
+    ) -> torch.Tensor:
+        """Enhanced inference with multiple advanced sampling strategies.
+        
+        Args:
+            x_source: Source input
+            inference_type: Type of inference ('cascaded', 'standard')
+            num_inference_steps: Number of inference steps
+            **kwargs: Additional arguments
+            
+        Returns:
+            Generated output
+        """
+        if inference_type == "cascaded" and hasattr(self, 'cascaded_sampler') and self.cascaded_sampler is not None:
+            # Use cascaded sampling
+            shape = x_source.shape
+            return self.cascaded_sampler.sample_cascaded(
+                shape=shape,
+                num_inference_steps=num_inference_steps,
+                **kwargs
+            )
+        else:
+            # Standard inference with current scheduler
+            return self.inference(
+                x_source=x_source,
+                num_inference_steps=num_inference_steps,
+                **kwargs
+            )
 
 
 # Legacy compatibility - keep SelfSupervisedDDPMTrainer as alias
 SelfSupervisedDDPMTrainer = DDPMTrainer
 
 
-# ===== 16-bit Output Utilities =====
+# ===== 16-bit Output Utilities (moved to utils.image_processing) =====
 
-def to_uint16_grayscale(
-    tensor: torch.Tensor, 
+
+# ===== Enhanced Factory Functions =====
+
+def create_enhanced_trainer(
+    model: nn.Module,
+    config: Dict[str, Any],
     transform: Optional[Any] = None,
-    percentile_clip: float = 99.5,
-    preserve_range: bool = True
-) -> np.ndarray:
-    """
-    Convert model output tensor to 16-bit grayscale numpy array.
+    forward_model: Optional[Any] = None,
+    enable_all_features: bool = True,
+) -> DDPMTrainer:
+    """Factory function to create DDPM trainer with advanced features.
     
     Args:
-        tensor: Model output tensor in model domain [-1, 1] or intensity domain
-        transform: Transform object to convert from model domain to intensity domain
-        percentile_clip: Percentile for clipping outliers (default: 99.5)
-        preserve_range: If True, preserve original intensity range; if False, normalize to full 16-bit
+        model: Model to train
+        config: Training configuration
+        transform: Data transform
+        forward_model: Forward model
+        enable_all_features: Enable all SOTA features
         
     Returns:
-        16-bit grayscale numpy array (0-65535)
+        Configured DDPM trainer with advanced features
     """
-    # Convert to numpy and squeeze to 2D if needed
-    if isinstance(tensor, torch.Tensor):
-        if tensor.is_cuda:
-            array = tensor.detach().cpu().numpy()
-        else:
-            array = tensor.detach().numpy()
-    else:
-        array = np.array(tensor)
+    if enable_all_features and SOTA_FEATURES_AVAILABLE:
+        config = create_enhanced_config(config)
     
-    # Remove batch and channel dimensions if present
-    while array.ndim > 2:
-        array = array.squeeze()
-    
-    # Convert from model domain to intensity domain if transform provided
-    if transform is not None:
-        # Convert back to tensor for transform
-        tensor_2d = torch.from_numpy(array).float()
-        if tensor_2d.ndim == 2:
-            tensor_2d = tensor_2d.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
-        
-        # Apply inverse transform
-        intensity_tensor = transform.inverse(tensor_2d)
-        array = intensity_tensor.squeeze().detach().cpu().numpy()
-    
-    # Ensure non-negative
-    array = np.clip(array, 0, None)
-    
-    if preserve_range:
-        # Preserve the original intensity range, just convert to uint16
-        # Clip outliers based on percentile
-        max_val = np.percentile(array, percentile_clip)
-        array = np.clip(array, 0, max_val)
-        
-        # Scale to 16-bit range while preserving relative intensities
-        if max_val > 0:
-            array = (array / max_val * 65535.0)
-    else:
-        # Normalize to full 16-bit range
-        min_val = np.percentile(array, 100 - percentile_clip)
-        max_val = np.percentile(array, percentile_clip)
-        
-        if max_val > min_val:
-            array = (array - min_val) / (max_val - min_val)
-        else:
-            array = np.zeros_like(array)
-        
-        array = array * 65535.0
-    
-    # Convert to uint16
-    return np.clip(array, 0, 65535).astype(np.uint16)
-
-
-def save_16bit_grayscale(
-    tensor: torch.Tensor,
-    path: str,
-    transform: Optional[Any] = None,
-    percentile_clip: float = 99.5,
-    preserve_range: bool = True
-) -> None:
-    """
-    Save model output as 16-bit grayscale TIFF image.
-    
-    Args:
-        tensor: Model output tensor
-        path: Output file path (should end with .tif or .tiff)
-        transform: Transform object to convert from model domain
-        percentile_clip: Percentile for clipping outliers
-        preserve_range: Whether to preserve original intensity range
-    """
-    try:
-        import tifffile
-    except ImportError:
-        raise ImportError("tifffile is required for saving 16-bit images. Install with: pip install tifffile")
-    
-    # Convert to 16-bit array
-    array_16bit = to_uint16_grayscale(
-        tensor, 
-        transform=transform, 
-        percentile_clip=percentile_clip,
-        preserve_range=preserve_range
+    return DDPMTrainer(
+        model=model,
+        config=config,
+        transform=transform,
+        forward_model=forward_model,
     )
-    
-    # Save as 16-bit TIFF
-    tifffile.imwrite(path, array_16bit, photometric='minisblack')
 
 
-def save_16bit_comparison(
-    wf_input: torch.Tensor,
-    prediction: torch.Tensor, 
-    gt_target: Optional[torch.Tensor],
-    path: str,
-    transform: Optional[Any] = None,
-    percentile_clip: float = 99.5,
-    preserve_range: bool = True
-) -> None:
-    """
-    Save side-by-side comparison as 16-bit TIFF: [WF | Prediction | GT].
+def create_enhanced_config(
+    base_config: Optional[Dict[str, Any]] = None,
+    max_resolution: int = 512,
+    enable_all_features: bool = True,
+) -> Dict[str, Any]:
+    """Create comprehensive enhanced configuration.
     
     Args:
-        wf_input: WF input tensor
-        prediction: Model prediction tensor
-        gt_target: Ground truth tensor (optional)
-        path: Output file path
-        transform: Transform object
-        percentile_clip: Percentile for clipping
-        preserve_range: Whether to preserve intensity range
+        base_config: Base configuration to extend
+        max_resolution: Maximum training resolution
+        enable_all_features: Enable all SOTA features
+        
+    Returns:
+        Complete enhanced configuration
     """
-    try:
-        import tifffile
-    except ImportError:
-        raise ImportError("tifffile is required for saving 16-bit images. Install with: pip install tifffile")
+    if base_config is None:
+        base_config = {}
     
-    # Convert all to 16-bit arrays
-    wf_16bit = to_uint16_grayscale(wf_input, transform, percentile_clip, preserve_range)
-    pred_16bit = to_uint16_grayscale(prediction, transform, percentile_clip, preserve_range)
+    enhanced_config = base_config.copy()
     
-    # Create comparison
-    if gt_target is not None:
-        gt_16bit = to_uint16_grayscale(gt_target, transform, percentile_clip, preserve_range)
-        comparison = np.concatenate([wf_16bit, pred_16bit, gt_16bit], axis=1)
-    else:
-        comparison = np.concatenate([wf_16bit, pred_16bit], axis=1)
+    if enable_all_features and SOTA_FEATURES_AVAILABLE:
+        # Advanced features
+        enhanced_config["advanced_features"] = {
+            "enable_frequency_losses": True,
+            "enable_advanced_schedulers": True,
+            "enable_memory_optimization": True,
+            "enable_cascaded_sampling": True,
+            "frequency_loss_weight": 0.1,
+            
+            # Frequency losses config
+            "frequency_losses": {
+                "use_fourier": True,
+                "use_spectral": True,
+                "use_wavelet": False,
+                "fourier_weight": 1.0,
+                "spectral_weight": 0.5,
+                "high_freq_loss_weight": 0.05,
+            },
+            
+            # Scheduler config
+            "scheduler": {
+                "type": "improved_cosine",
+                "params": {
+                    "s": 0.008,
+                    "cosine_power": 1.0,
+                    "max_beta": 0.999,
+                },
+            },
+            
+            # Memory optimization
+            "memory_optimization": {
+                "enable_dynamic_scaling": True,
+                "memory_pressure_threshold": 0.85,
+                "safety_factor": 0.8,
+                "enable_monitoring": True,
+            },
+            
+            # Cascaded sampling
+            "cascaded_sampling": {
+                "enabled": True,
+                "type": "basic",
+                "resolution_schedule": [64, 128, 256, max_resolution],
+                "params": {
+                    "consistency_weight": 0.1,
+                    "upsampling_method": "bilinear",
+                    "memory_efficient": True,
+                },
+            },
+        }
     
-    # Save as 16-bit TIFF
-    tifffile.imwrite(path, comparison, photometric='minisblack')
+    return enhanced_config
 
+
+def get_advanced_feature_status() -> Dict[str, bool]:
+    """Get status of all advanced features implementation.
+    
+    Returns:
+        Dictionary with feature implementation status
+    """
+    return {
+        "advanced_features_available": SOTA_FEATURES_AVAILABLE,
+        "frequency_domain_loss": SOTA_FEATURES_AVAILABLE,
+        "advanced_schedulers": SOTA_FEATURES_AVAILABLE,
+        "memory_optimization": SOTA_FEATURES_AVAILABLE,
+        "cascaded_sampling": SOTA_FEATURES_AVAILABLE,
+    }
+
+
+def print_advanced_features_summary():
+    """Print comprehensive summary of advanced features implementation."""
+    print("🚀 Advanced DDPM Features Summary")
+    print("=" * 50)
+    
+    features = get_advanced_feature_status()
+    for feature, implemented in features.items():
+        status = "✅" if implemented else "❌"
+        print(f"{status} {feature.replace('_', ' ').title()}")
+    
+    if SOTA_FEATURES_AVAILABLE:
+        print("\n🔥 All advanced features successfully integrated into DDPMTrainer!")
+        print("\nKey Components:")
+        print("• Advanced frequency domain losses")
+        print("• Advanced noise schedulers (beyond diffusers)")
+        print("• Adaptive batch sizing with memory optimization")
+        print("• Multi-resolution cascaded sampling")
+        print("• Comprehensive performance monitoring")
+        print("• Memory-efficient training and inference")
+        
+        print("\n💡 Usage:")
+        print("```python")
+        print("from pkl_dg.models.diffusion import create_enhanced_trainer, create_enhanced_config")
+        print("")
+        print("# Create enhanced configuration")
+        print("config = create_enhanced_config(max_resolution=512)")
+        print("")
+        print("# Create enhanced trainer")
+        print("trainer = create_enhanced_trainer(model, config)")
+        print("")
+        print("# Train with all advanced features")
+        print("trainer.fit(dataloader)")
+        print("```")
+    else:
+        print("\n⚠️ Advanced features not available - missing dependencies")
+        print("Install with: pip install -e .")
 
 

@@ -1,11 +1,10 @@
 import torch
 
-from pkl_dg.evaluation.robustness import RobustnessTests
+from pkl_dg.evaluation import RobustnessTests
 from pkl_dg.models.sampler import DDIMSampler
 from pkl_dg.data import IntensityToModel
 from pkl_dg.guidance import PKLGuidance, AdaptiveSchedule
-from pkl_dg.physics.psf import PSF
-from pkl_dg.physics.forward_model import ForwardModel
+from pkl_dg.physics import PSF, ForwardModel
 
 
 class _DummyNet(torch.nn.Module):
@@ -31,7 +30,7 @@ def _make_sampler(device: str = "cpu") -> DDIMSampler:
     fm = ForwardModel(psf=psf_t, background=0.0, device=device)
     guidance = PKLGuidance()
     schedule = AdaptiveSchedule(lambda_base=0.05, T_threshold=40, T_total=50)
-    transform = IntensityToModel(minIntensity=0, maxIntensity=1000)
+    transform = IntensityToModel(min_intensity=0, max_intensity=1000)
     sampler = DDIMSampler(
         model=trainer,
         forward_model=fm,

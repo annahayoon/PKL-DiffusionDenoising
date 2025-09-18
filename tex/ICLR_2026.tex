@@ -120,7 +120,7 @@ Our evaluation protocol is designed to rigorously compare the three guidance mec
 \subsection{Data and Model Details}
 \textbf{Dataset:} Our training and test sets consist of [{\# of image pairs}] registered pairs of widefield ($\mathbf{y}$) and two-photon ($\mathbf{x}$) images of GCaMP6s-expressing neurons in the mouse brain.
 
-\textbf{Training Data Synthesis:} To generate a simulated dataset for training our models, we utilized photographs from an ImageNet-like collection of license-friendly images. Each image was processed through a forward microscopy model, termed the Image Acquisition Model (\wf $\rightarrow$ \twop). This model simulates the effects of \wf and \twop microscopes by convolving each image with a Point Spread Function (PSF), then applying Poisson noise and adding a Gaussian background term to mimic out-of-fluorescence background.
+\textbf{Training Data Synthesis:} To generate a simulated dataset for training our models, we utilized photographs from a collection of license-friendly external images. Each image was processed through a forward microscopy model, termed the Image Acquisition Model (\wf $\rightarrow$ \twop). This model simulates the effects of \wf and \twop microscopes by convolving each image with a Point Spread Function (PSF), then applying Poisson noise and adding a Gaussian background term to mimic out-of-fluorescence background.
 
 \textbf{Physical Model Parameters:} The PSF for the operator $\mathcal{A}$ and the background term $B$ were empirically measured from images of sub-diffraction fluorescent beads and blank fields of view, respectively.
 

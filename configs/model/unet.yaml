@@ -1,5 +1,5 @@
 # UNet model configuration for diffusion training
-sample_size: 256
+sample_size: 128
 in_channels: 1  # unconditional prior by default; conditioner concatenation optional
 out_channels: 1
 layers_per_block: 2

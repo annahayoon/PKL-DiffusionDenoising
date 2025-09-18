@@ -1,0 +1,21 @@
+# Training Configuration with Adaptive Normalization
+
+data:
+  _target_: pkl_dg.data.adaptive_dataset.AdaptiveRealPairsDataset
+  data_dir: "data/real_microscopy"
+  normalization_params_path: "data/real_microscopy/adaptive_normalization_params.json"
+  create_normalization_params: false  # Use existing parameters
+  percentiles: [0.1, 99.9]
+
+training:
+  batch_size: 8
+  num_workers: 4
+  device: "cuda"
+  
+# Normalization parameters (for reference)
+normalization:
+  wf_range: [2057.0, 14357.0]
+  tp_range: [100.0, 211.0]
+  target_range: [-1.0, 1.0]
+  method: "adaptive_percentile"
+  preserves_intensities: true

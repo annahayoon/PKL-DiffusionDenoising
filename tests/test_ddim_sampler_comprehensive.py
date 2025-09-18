@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 from pkl_dg.models.sampler import DDIMSampler
 from pkl_dg.guidance import PKLGuidance, L2Guidance, AdaptiveSchedule
 from pkl_dg.data import IntensityToModel
-from pkl_dg.physics.forward_model import ForwardModel
+from pkl_dg.physics import ForwardModel
 
 
 class DummyNet(nn.Module):
@@ -47,10 +47,11 @@ class DummyTrainer(nn.Module):
         return torch.clamp(betas, 0.0001, 0.9999)
 
 
-def _make_forward_model(device: str = "cpu") -> ForwardModel:
-    """Create a simple forward model for testing."""
-    psf = torch.ones(9, 9) / 81.0
-    return ForwardModel(psf=psf, background=0.0, device=device)
+# Import shared test utilities
+from tests.test_utils import make_forward_model
+
+# Use the shared make_forward_model function directly instead of creating a wrapper
+_make_forward_model = lambda device="cpu": make_forward_model(device=device, background=0.0)
 
 
 def _make_sampler(

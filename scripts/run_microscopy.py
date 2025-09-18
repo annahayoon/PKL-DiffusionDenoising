@@ -23,8 +23,14 @@ Examples:
     # Quick training run
     python scripts/run_microscopy.py --mode train --config configs/config_real.yaml --max-epochs 10
     
+    # Training with adaptive normalization for better dynamic range
+    python scripts/run_microscopy.py --mode train --config configs/config_real.yaml --use-adaptive-normalization --adaptive-percentiles 0.1 99.9
+    
     # Full pipeline with evaluation
     python scripts/run_microscopy.py --mode train_eval --config configs/config_real.yaml --eval-input data/test/wf --eval-gt data/test/2p
+    
+    # Full pipeline with adaptive normalization
+    python scripts/run_microscopy.py --mode train_eval --config configs/config_real.yaml --use-adaptive-normalization --eval-input data/test/wf --eval-gt data/test/2p
     
     # Evaluation only with baselines
     python scripts/run_microscopy.py --mode eval --checkpoint checkpoints/best_model.pt --input-dir data/test/wf --gt-dir data/test/2p --include-baselines
@@ -75,22 +81,42 @@ sys.path.insert(0, str(project_root))
 from pkl_dg.models.unet import UNet
 from pkl_dg.models.diffusion import DDPMTrainer, UnpairedDataset
 from pkl_dg.models.sampler import DDIMSampler
-from pkl_dg.data import RealPairsDataset, IntensityToModel, AnscombeToModel, GeneralizedAnscombeToModel
-from pkl_dg.data import ZarrPatchesDataset
-from pkl_dg.physics.psf import PSF, build_psf_bank
-from pkl_dg.physics.forward_model import ForwardModel
-from pkl_dg.guidance.pkl_optical_restoration import PKLGuidance
-from pkl_dg.guidance.l2 import L2Guidance
-from pkl_dg.guidance.anscombe import AnscombeGuidance
-from pkl_dg.guidance.schedules import AdaptiveSchedule
-from pkl_dg.evaluation.metrics import Metrics
+from pkl_dg.data import RealPairsDataset, IntensityToModel, Microscopy16BitToModel
+
+# Optional Zarr import
+try:
+    from pkl_dg.data import ZarrPatchesDataset
+    HAS_ZARR = True
+except ImportError:
+    ZarrPatchesDataset = None
+    HAS_ZARR = False
+from pkl_dg.data.adaptive_dataset import create_adaptive_datasets, AdaptiveRealPairsDataset
+from pkl_dg.physics import PSF, build_psf_bank, ForwardModel
+# Guidance is a single module, not a package
+try:
+    from pkl_dg.guidance import PKLGuidance, L2Guidance, AnscombeGuidance
+    HAS_GUIDANCE = True
+except ImportError:
+    PKLGuidance = L2Guidance = AnscombeGuidance = None
+    HAS_GUIDANCE = False
+from pkl_dg.evaluation import Metrics
 # from pkl_dg.evaluation.robustness import RobustnessTests
 # from pkl_dg.evaluation.hallucination import HallucinationTests
 # from pkl_dg.evaluation.tasks import DownstreamTasks
-from pkl_dg.baselines import richardson_lucy_restore
-from pkl_dg.utils.memory import cleanup_memory
+# Baselines import
+try:
+    from pkl_dg.baseline import richardson_lucy_restore
+    HAS_BASELINES = True
+except ImportError:
+    richardson_lucy_restore = None
+    HAS_BASELINES = False
+# Memory cleanup import
+try:
+    from pkl_dg.utils import cleanup_memory
+except ImportError:
+    def cleanup_memory():
+        pass
 from pkl_dg.utils import (
-    load_config, 
     print_config_summary,
     validate_and_complete_config,
     setup_logging
@@ -98,7 +124,7 @@ from pkl_dg.utils import (
 
 # Optional imports
 try:
-    from pkl_dg.baselines import RCANWrapper
+    from pkl_dg.baseline import RCANWrapper
     HAS_RCAN = True
 except ImportError:
     HAS_RCAN = False
@@ -142,6 +168,13 @@ def setup_experiment(args, cfg: Optional[DictConfig] = None) -> DictConfig:
         cfg.experiment.device = args.device
     if args.seed is not None:
         cfg.experiment.seed = args.seed
+    
+    # Override data configuration with command line arguments
+    if hasattr(args, 'use_adaptive_normalization') and args.use_adaptive_normalization:
+        cfg.data.use_adaptive_normalization = True
+        if not hasattr(cfg.data, 'adaptive'):
+            cfg.data.adaptive = {}
+        cfg.data.adaptive.percentiles = args.adaptive_percentiles
         
     # Setup paths
     if args.data_dir is not None:
@@ -198,12 +231,17 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         config_name = Path(args.config).stem if args.config else "default"
         run_name = f"{config_name}_{cfg.experiment.name}_{timestamp}"
         
+        # Ensure wandb uses project root directory instead of current working directory
+        wandb_dir = project_root / "wandb"
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        
         wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
             config=OmegaConf.to_container(cfg, resolve=True),
             name=run_name,
             mode=cfg.wandb.mode,
+            dir=str(wandb_dir.parent),  # Set to project root so wandb creates wandb/ subdirectory there
             tags=[config_name, cfg.experiment.name, f"seed_{seed}"]
         )
 
@@ -212,8 +250,16 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    data_dir = Path(cfg.paths.data)
-    checkpoint_dir = Path(cfg.paths.checkpoints)
+    # Setup paths - ensure all paths are relative to project root
+    if Path(cfg.paths.data).is_absolute():
+        data_dir = Path(cfg.paths.data)
+    else:
+        data_dir = project_root / cfg.paths.data
+        
+    if Path(cfg.paths.checkpoints).is_absolute():
+        checkpoint_dir = Path(cfg.paths.checkpoints)
+    else:
+        checkpoint_dir = project_root / cfg.paths.checkpoints
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     # Setup timestamp and config name for consistent naming
@@ -221,8 +267,12 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     config_name = Path(args.config).stem if args.config else "default"
     
-    # Setup file logging
-    logs_dir = Path(cfg.paths.logs)
+    # Setup file logging - ensure logs go to project root instead of current working directory
+    # Convert relative path to absolute path based on project root
+    if Path(cfg.paths.logs).is_absolute():
+        logs_dir = Path(cfg.paths.logs)
+    else:
+        logs_dir = project_root / cfg.paths.logs
     logs_dir.mkdir(parents=True, exist_ok=True)
     
     # Use same naming convention as W&B (timestamp and config_name already defined above)
@@ -248,24 +298,19 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
 
     # Create transform based on noise model
     noise_model = str(getattr(cfg.data, "noise_model", "gaussian")).lower()
-    if noise_model == "poisson":
-        transform = AnscombeToModel(max_intensity=float(cfg.data.max_intensity))
-        print("✅ Using Anscombe transform for Poisson noise")
-    elif noise_model == "poisson_gaussian":
-        gat_cfg = getattr(cfg.data, "gat", {})
-        transform = GeneralizedAnscombeToModel(
-            max_intensity=float(cfg.data.max_intensity),
-            alpha=float(getattr(gat_cfg, "alpha", 1.0)),
-            mu=float(getattr(gat_cfg, "mu", 0.0)),
-            sigma=float(getattr(gat_cfg, "sigma", 0.0)),
+    if noise_model == "microscopy_16bit":
+        transform = Microscopy16BitToModel(
+            max_intensity=float(getattr(cfg.data, "max_intensity", 65535)),
+            min_intensity=float(getattr(cfg.data, "min_intensity", 0))
         )
-        print("✅ Using Generalized Anscombe transform for Poisson-Gaussian noise")
+        print("✅ Using 16-bit microscopy transform")
     else:
+        # Default to intensity normalization for all noise models
         transform = IntensityToModel(
-            min_intensity=float(cfg.data.min_intensity),
-            max_intensity=float(cfg.data.max_intensity),
+            min_intensity=float(getattr(cfg.data, "min_intensity", 0)),
+            max_intensity=float(getattr(cfg.data, "max_intensity", 65535)),
         )
-        print("✅ Using intensity normalization for Gaussian noise")
+        print(f"✅ Using intensity normalization for {noise_model} noise")
 
     # Create forward model for cycle consistency (self-supervised training)
     # Check physics config first for PSF settings
@@ -295,7 +340,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
                 print(f"✅ Loaded PSF from bead data (mode: {list(psf_bank.keys())[0]})")
             
             # Extract sigma values from PSF for logging
-            from pkl_dg.physics.psf import psf_params_from_tensor
+            from pkl_dg.physics import psf_params_from_tensor
             sigma_x, sigma_y = psf_params_from_tensor(psf_tensor)
             
             # Extract pixel size information from PSF tensor
@@ -388,9 +433,76 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     # Create datasets
     use_zarr = bool(getattr(cfg.data, "use_zarr", False))
     use_self_supervised = bool(getattr(cfg.data, "use_self_supervised", True))
+    use_adaptive_normalization = bool(getattr(cfg.data, "use_adaptive_normalization", False))
     
-    if use_zarr:
+    if use_adaptive_normalization:
+        # Use adaptive normalization for better dynamic range utilization
+        print("✅ Using adaptive normalization datasets")
+        
+        # Get adaptive normalization config
+        adaptive_cfg = getattr(cfg.data, "adaptive", {})
+        percentiles = tuple(getattr(adaptive_cfg, "percentiles", [0.1, 99.9]))
+        
+        # Resolve data directory path
+        if Path(cfg.paths.data).is_absolute():
+            adaptive_data_dir = Path(cfg.paths.data)
+        else:
+            adaptive_data_dir = project_root / cfg.paths.data
+            
+        # Create adaptive datasets
+        datasets = create_adaptive_datasets(
+            data_dir=str(adaptive_data_dir),
+            batch_size=int(cfg.training.batch_size),
+            num_workers=int(cfg.training.num_workers),
+            percentiles=percentiles,
+            transform=None  # Adaptive normalization handles the normalization
+        )
+        
+        train_dataset = datasets['train_dataset']
+        val_dataset = datasets['val_dataset']
+        
+        # Get normalization parameters for logging
+        params = datasets['normalization_params']
+        print(f"📊 Adaptive Normalization Parameters:")
+        print(f"  WF: [{params.wf_min:.1f}, {params.wf_max:.1f}] -> [-1, 1]")
+        print(f"  2P: [{params.tp_min:.1f}, {params.tp_max:.1f}] -> [-1, 1]")
+        print(f"✅ Benefits: Better dynamic range utilization, preserved pixel intensity recovery")
+        
+        # Demonstrate the benefits (similar to the training script)
+        print(f"\n✅ Benefits for DDPM Training:")
+        
+        # Calculate dynamic range improvements
+        wf_old_range = 65535.0 - 0.0  # Typical 16-bit range
+        tp_old_range = 65535.0 - 0.0
+        wf_new_range = params.wf_max - params.wf_min
+        tp_new_range = params.tp_max - params.tp_min
+        
+        wf_improvement = 2.0 / (wf_new_range / wf_old_range) if wf_new_range > 0 else 1.0
+        tp_improvement = 2.0 / (tp_new_range / tp_old_range) if tp_new_range > 0 else 1.0
+        
+        print(f"  • {tp_improvement:.1f}x better dynamic range for 2P data")
+        print(f"  • {wf_improvement:.1f}x better dynamic range for WF data")
+        print(f"  • Full utilization of [-1, 1] input range")
+        print(f"  • Better gradient flow and numerical stability")
+        print(f"  • Preserved ability to recover exact pixel intensities")
+        
+        # Log to W&B if enabled
+        if cfg.wandb.mode != "disabled":
+            wandb.log({
+                "normalization/wf_min": params.wf_min,
+                "normalization/wf_max": params.wf_max,
+                "normalization/tp_min": params.tp_min,
+                "normalization/tp_max": params.tp_max,
+                "normalization/wf_range": params.wf_max - params.wf_min,
+                "normalization/tp_range": params.tp_max - params.tp_min,
+                "normalization/wf_improvement": wf_improvement,
+                "normalization/tp_improvement": tp_improvement
+            })
+            
+    elif use_zarr:
         # Use Zarr format for large datasets
+        if not HAS_ZARR:
+            raise ImportError("Zarr support not available. Install zarr package to use this feature.")
         zarr_train = data_dir / "zarr" / "train.zarr"
         zarr_val = data_dir / "zarr" / "val.zarr"
         train_dataset = ZarrPatchesDataset(str(zarr_train), transform=transform)
@@ -507,27 +619,34 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     print(f"Training dataset: {len(train_dataset)} samples")
     print(f"Validation dataset: {len(val_dataset)} samples")
 
-    # Create data loaders
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=True,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=True,
-        persistent_workers=bool(getattr(cfg.training, "persistent_workers", True)),
-        prefetch_factor=int(getattr(cfg.training, "prefetch_factor", 4)),
-        drop_last=True
-    )
+    # Create data loaders - use existing ones if adaptive normalization already created them
+    if use_adaptive_normalization:
+        # Adaptive datasets already created data loaders
+        train_loader = datasets['train_loader']
+        val_loader = datasets['val_loader']
+        print("✅ Using data loaders from adaptive dataset creation")
+    else:
+        # Create data loaders for other dataset types
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=int(cfg.training.batch_size),
+            shuffle=True,
+            num_workers=int(cfg.training.num_workers),
+            pin_memory=True,
+            persistent_workers=bool(getattr(cfg.training, "persistent_workers", True)),
+            prefetch_factor=int(getattr(cfg.training, "prefetch_factor", 4)),
+            drop_last=True
+        )
 
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=False,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=True,
-        persistent_workers=bool(getattr(cfg.training, "persistent_workers", True)),
-        prefetch_factor=int(getattr(cfg.training, "prefetch_factor", 4)),
-    )
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=int(cfg.training.batch_size),
+            shuffle=False,
+            num_workers=int(cfg.training.num_workers),
+            pin_memory=True,
+            persistent_workers=bool(getattr(cfg.training, "persistent_workers", True)),
+            prefetch_factor=int(getattr(cfg.training, "prefetch_factor", 4)),
+        )
 
     # Create model
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
@@ -629,7 +748,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
             dirpath=checkpoint_dir / "intermediate",
             filename='ddpm-intermediate-{step:06d}',
             every_n_train_steps=5000,  # Intermediate saves every 5K steps
-            save_top_k=2,  # Keep only last 2 intermediate checkpoints
+            save_top_k=-1,  # Save all checkpoints
             save_last=False,  # Don't duplicate last checkpoint
             verbose=False  # Less verbose for intermediate saves
         )
@@ -657,7 +776,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
             gradient_clip_val=grad_clip_val,
             accumulate_grad_batches=int(cfg.training.get('accumulate_grad_batches', 1)),
             log_every_n_steps=int(cfg.training.get('log_every_n_steps', 100)),
-            val_check_interval=int(cfg.training.get('val_check_steps', 2500)),  # Validate every 2.5K steps
+            val_check_interval=min(int(cfg.training.get('val_check_steps', 1000)), 1051),  # Validate every 1K steps, max 1051
             limit_val_batches=float(cfg.training.get('limit_val_batches', 1.0)),  # Limit validation batches for speed
             enable_progress_bar=True,
             enable_model_summary=False,  # Disable for speed
@@ -869,20 +988,16 @@ def load_model_and_sampler(cfg: DictConfig, checkpoint_path: str, guidance_type:
     
     # Create transform
     noise_model = str(getattr(cfg.data, "noise_model", "gaussian")).lower()
-    if noise_model == "poisson":
-        transform = AnscombeToModel(max_intensity=float(cfg.data.max_intensity))
-    elif noise_model == "poisson_gaussian":
-        gat_cfg = getattr(cfg.data, "gat", {})
-        transform = GeneralizedAnscombeToModel(
-            max_intensity=float(cfg.data.max_intensity),
-            alpha=float(getattr(gat_cfg, "alpha", 1.0)),
-            mu=float(getattr(gat_cfg, "mu", 0.0)),
-            sigma=float(getattr(gat_cfg, "sigma", 0.0)),
+    if noise_model == "microscopy_16bit":
+        transform = Microscopy16BitToModel(
+            max_intensity=float(getattr(cfg.data, "max_intensity", 65535)),
+            min_intensity=float(getattr(cfg.data, "min_intensity", 0))
         )
     else:
+        # Default to intensity normalization for all noise models
         transform = IntensityToModel(
-            min_intensity=float(cfg.data.min_intensity),
-            max_intensity=float(cfg.data.max_intensity),
+            min_intensity=float(getattr(cfg.data, "min_intensity", 0)),
+            max_intensity=float(getattr(cfg.data, "max_intensity", 65535)),
         )
     
     # Create guidance - use same PSF logic as training
@@ -979,33 +1094,22 @@ def load_model_and_sampler(cfg: DictConfig, checkpoint_path: str, guidance_type:
     return sampler
 
 
-def compute_evaluation_metrics(pred: np.ndarray, gt: np.ndarray) -> Dict[str, float]:
-    """Compute evaluation metrics between prediction and ground truth."""
-    try:
-        # Use the direct Metrics class
-        return {
-            "psnr": Metrics.psnr(pred, gt),
-            "ssim": Metrics.ssim(pred, gt, data_range=1.0),
-            "frc": Metrics.frc(pred, gt, threshold=0.143)
-        }
-    except Exception as e:
-        print(f"⚠️ Error computing metrics: {e}")
-        return {
-            "psnr": float('nan'),
-            "ssim": float('nan'), 
-            "frc": float('nan')
-        }
+# Import consolidated metrics function
+from pkl_dg.metrics import compute_evaluation_metrics
 
 
 def compute_baseline_metrics(wf_input: np.ndarray, gt: np.ndarray, psf: Optional[np.ndarray] = None) -> Dict[str, Dict[str, float]]:
-    """Compute baseline method results."""
+    """Compute baseline method results using centralized metrics."""
+    # Import centralized metrics to avoid duplication
+    from pkl_dg.metrics import compute_standard_metrics
+    
     results = {}
     
     # Richardson-Lucy baseline
     if psf is not None:
         try:
             rl_result = richardson_lucy_restore(wf_input, psf, iterations=30)
-            results["richardson_lucy"] = compute_evaluation_metrics(rl_result, gt)
+            results["richardson_lucy"] = compute_standard_metrics(rl_result, gt)
         except Exception as e:
             print(f"⚠️ Richardson-Lucy failed: {e}")
             results["richardson_lucy"] = {"psnr": float('nan'), "ssim": float('nan'), "frc": float('nan')}
@@ -1014,7 +1118,7 @@ def compute_baseline_metrics(wf_input: np.ndarray, gt: np.ndarray, psf: Optional
     if HAS_RCAN:
         try:
             # Note: This would require a trained RCAN model
-            # results["rcan"] = compute_metrics(rcan_result, gt)
+            # results["rcan"] = compute_standard_metrics(rcan_result, gt)
             pass
         except Exception:
             pass
@@ -1272,6 +1376,10 @@ def main():
     parser.add_argument('--data-dir', type=str, help='Training data directory')
     parser.add_argument('--checkpoint-dir', type=str, help='Checkpoint directory')
     parser.add_argument('--output-dir', type=str, help='Output directory')
+    parser.add_argument('--use-adaptive-normalization', action='store_true', 
+                       help='Use adaptive normalization for better dynamic range utilization')
+    parser.add_argument('--adaptive-percentiles', nargs=2, type=float, default=[0.1, 99.9],
+                       help='Percentile range for adaptive normalization (default: 0.1 99.9)')
     
     # Evaluation arguments
     parser.add_argument('--checkpoint', type=str, help='Model checkpoint for evaluation')

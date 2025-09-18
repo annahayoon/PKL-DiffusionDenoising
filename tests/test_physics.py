@@ -1,9 +1,7 @@
 import torch
 import numpy as np
 
-from pkl_dg.physics.psf import PSF
-from pkl_dg.physics.forward_model import ForwardModel
-from pkl_dg.physics.noise import PoissonNoise, GaussianBackground
+from pkl_dg.physics import PSF, ForwardModel, PoissonNoise, GaussianBackground
 
 
 def test_psf_normalization():

@@ -104,7 +104,15 @@ class ProgressiveUNet(nn.Module):
 
 
 class ProgressiveTrainer(DDPMTrainer):
-    """DDPM trainer with progressive training support."""
+    """DDPM trainer with advanced progressive training support.
+    
+    Features:
+    - Resolution curriculum with smooth transitions
+    - Adaptive batch scaling based on resolution
+    - Cross-resolution consistency losses
+    - Dynamic noise scheduling per resolution
+    - Hierarchical feature consistency
+    """
     
     def __init__(
         self,
@@ -134,6 +142,7 @@ class ProgressiveTrainer(DDPMTrainer):
         
         if self.enable_progressive:
             self._setup_progressive_training()
+            self._setup_curriculum_components()
     
     def _setup_progressive_training(self):
         """Setup progressive training parameters."""
@@ -141,53 +150,139 @@ class ProgressiveTrainer(DDPMTrainer):
         self.resolution_schedule = self.model.resolutions
         self.current_phase = 0
         
-        # Training epochs per resolution
-        self.epochs_per_resolution = self.progressive_config.get("epochs_per_resolution", [10, 15, 20, 25])
+        # Training epochs per resolution with curriculum
+        base_epochs = self.progressive_config.get("epochs_per_resolution", [10, 15, 20, 25])
+        curriculum_type = self.progressive_config.get("curriculum_type", "linear")  # linear, exponential, adaptive
+        
+        if curriculum_type == "exponential":
+            # More epochs at higher resolutions (exponential growth)
+            self.epochs_per_resolution = [int(base_epochs[0] * (1.5 ** i)) for i in range(len(self.resolution_schedule))]
+        elif curriculum_type == "adaptive":
+            # Adaptive based on convergence (placeholder for now)
+            self.epochs_per_resolution = base_epochs.copy()
+        else:
+            # Linear progression
+            self.epochs_per_resolution = base_epochs.copy()
         
         # Ensure we have enough epoch specifications
         while len(self.epochs_per_resolution) < len(self.resolution_schedule):
-            self.epochs_per_resolution.append(self.epochs_per_resolution[-1])
+            self.epochs_per_resolution.append(int(self.epochs_per_resolution[-1] * 1.2))
         
         # Transition settings
         self.smooth_transitions = self.progressive_config.get("smooth_transitions", True)
         self.transition_epochs = self.progressive_config.get("transition_epochs", 2)
+        self.blend_mode = self.progressive_config.get("blend_mode", "alpha")  # alpha, feature, loss
         
-        # Learning rate scaling
+        # Learning rate scaling with curriculum
         self.lr_scaling = self.progressive_config.get("lr_scaling", True)
+        self.lr_curriculum = self.progressive_config.get("lr_curriculum", "sqrt")  # sqrt, linear, constant
         self.base_lr = self.config.get("learning_rate", 1e-4)
         
-        # Batch size scaling
+        # Batch size scaling with memory optimization
         self.batch_scaling = self.progressive_config.get("batch_scaling", True)
+        self.adaptive_batch_scaling = self.progressive_config.get("adaptive_batch_scaling", True)
         self.base_batch_size = self.config.get("training", {}).get("batch_size", 8)
         
-        print(f"✅ Progressive training enabled:")
+        # Cross-resolution consistency
+        self.cross_resolution_consistency = self.progressive_config.get("cross_resolution_consistency", True)
+        self.consistency_weight = self.progressive_config.get("consistency_weight", 0.1)
+        
+        print(f"✅ Advanced progressive training enabled:")
         print(f"   Resolution schedule: {self.resolution_schedule}")
         print(f"   Epochs per resolution: {self.epochs_per_resolution}")
-        print(f"   Smooth transitions: {self.smooth_transitions}")
+        print(f"   Curriculum type: {curriculum_type}")
+        print(f"   Cross-resolution consistency: {self.cross_resolution_consistency}")
+        print(f"   Adaptive batch scaling: {self.adaptive_batch_scaling}")
+    
+    def _setup_curriculum_components(self):
+        """Setup components for curriculum learning."""
+        # Feature consistency loss for cross-resolution training
+        if self.cross_resolution_consistency:
+            self.feature_consistency_loss = nn.MSELoss()
+        
+        # Resolution-specific noise schedules
+        self.resolution_noise_schedules = {}
+        for res in self.resolution_schedule:
+            # Higher resolutions get more timesteps for finer control
+            timesteps = min(self.num_timesteps, int(self.num_timesteps * (res / self.resolution_schedule[0]) ** 0.5))
+            self.resolution_noise_schedules[res] = timesteps
+        
+        # Adaptive batch sizer for memory optimization
+        if self.adaptive_batch_scaling:
+            try:
+                from ..utils.utils import AdaptiveBatchSizer
+                self.batch_sizer = AdaptiveBatchSizer(verbose=False)
+            except ImportError:
+                print("⚠️ AdaptiveBatchSizer not available, using fixed batch scaling")
+                self.batch_sizer = None
+                self.adaptive_batch_scaling = False
+        else:
+            self.batch_sizer = None
+        
+        # Track training statistics for adaptive curriculum
+        self.phase_stats = {
+            "losses": [],
+            "convergence_rates": [],
+            "phase_start_epochs": []
+        }
     
     def get_current_resolution_config(self) -> Dict[str, Any]:
-        """Get configuration for current resolution."""
+        """Get configuration for current resolution with advanced curriculum."""
         if not self.enable_progressive:
             return {}
         
         resolution = self.resolution_schedule[self.current_phase]
         
-        # Scale learning rate (higher resolution = lower LR)
+        # Advanced learning rate scaling based on curriculum type
         lr_scale = 1.0
         if self.lr_scaling and self.current_phase > 0:
-            lr_scale = (64 / resolution) ** 0.5  # Square root scaling
+            if self.lr_curriculum == "sqrt":
+                lr_scale = (64 / resolution) ** 0.5  # Square root scaling
+            elif self.lr_curriculum == "linear":
+                lr_scale = 64 / resolution  # Linear scaling
+            elif self.lr_curriculum == "constant":
+                lr_scale = 1.0  # No scaling
+            else:
+                lr_scale = (64 / resolution) ** 0.5  # Default to sqrt
         
-        # Scale batch size (higher resolution = smaller batch)
-        batch_scale = 1
-        if self.batch_scaling:
-            batch_scale = max(1, (64 // resolution) * 2)
+        # Adaptive batch size scaling
+        if self.adaptive_batch_scaling and self.batch_sizer is not None:
+            try:
+                # Use adaptive batch sizer to get optimal batch size for current resolution
+                input_shape = (1, resolution, resolution)  # Grayscale microscopy
+                optimal_batch_size = self.batch_sizer.find_optimal_batch_size(
+                    model=self.model.base_unet,
+                    input_shape=input_shape,
+                    mixed_precision=self.mixed_precision,
+                    gradient_checkpointing=getattr(self.model, 'gradient_checkpointing', False),
+                    device="cuda" if torch.cuda.is_available() else "cpu"
+                )
+                batch_size = optimal_batch_size
+            except Exception as e:
+                print(f"⚠️ Adaptive batch sizing failed: {e}")
+                # Fallback to fixed scaling
+                batch_scale = max(1, int((self.resolution_schedule[0] / resolution) ** 2))
+                batch_size = max(1, self.base_batch_size // batch_scale)
+        elif self.batch_scaling:
+            # Fixed batch size scaling
+            batch_scale = max(1, int((self.resolution_schedule[0] / resolution) ** 2))
+            batch_size = max(1, self.base_batch_size // batch_scale)
+        else:
+            batch_size = self.base_batch_size
+        
+        # Resolution-specific timesteps
+        timesteps = self.resolution_noise_schedules.get(resolution, self.num_timesteps)
         
         return {
             "resolution": resolution,
             "learning_rate": self.base_lr * lr_scale,
-            "batch_size": max(1, self.base_batch_size // batch_scale),
+            "batch_size": batch_size,
+            "timesteps": timesteps,
             "phase": self.current_phase,
-            "total_phases": len(self.resolution_schedule)
+            "total_phases": len(self.resolution_schedule),
+            "lr_scale": lr_scale,
+            "transition_alpha": self.model.transition_alpha,
+            "consistency_weight": self.consistency_weight if self.cross_resolution_consistency else 0.0
         }
     
     def advance_progressive_phase(self) -> bool:
@@ -234,10 +329,16 @@ class ProgressiveTrainer(DDPMTrainer):
             self.model.set_transition_alpha(1.0)
     
     def should_advance_phase(self, epoch: int, phase_start_epoch: int) -> bool:
-        """Check if should advance to next phase."""
+        """Check if should advance to next phase (with adaptive support)."""
         if not self.enable_progressive:
             return False
         
+        # Use adaptive advancement if enabled
+        curriculum_type = self.progressive_config.get("curriculum_type", "linear")
+        if curriculum_type == "adaptive":
+            return self.should_advance_phase_adaptive(epoch, phase_start_epoch)
+        
+        # Standard fixed advancement
         epochs_in_phase = epoch - phase_start_epoch
         target_epochs = self.epochs_per_resolution[self.current_phase]
         
@@ -260,7 +361,7 @@ class ProgressiveTrainer(DDPMTrainer):
         return batch
     
     def training_step(self, batch, batch_idx):
-        """Training step with progressive support."""
+        """Training step with advanced progressive support."""
         # Preprocess batch for current resolution
         if isinstance(batch, (list, tuple)):
             x_0, c_wf = batch
@@ -271,17 +372,111 @@ class ProgressiveTrainer(DDPMTrainer):
         else:
             batch = self.preprocess_batch_progressive(batch)
         
-        # Call parent training step
-        loss = super().training_step(batch, batch_idx)
+        # Get current resolution config
+        config = self.get_current_resolution_config()
+        current_resolution = config.get("resolution", self.resolution_schedule[0])
+        
+        # Main training step with resolution-specific timesteps
+        if isinstance(batch, (list, tuple)):
+            x_0, c_wf = batch
+            b = x_0.shape[0]
+            device = x_0.device
+            
+            # Use resolution-specific timesteps
+            max_t = config.get("timesteps", self.num_timesteps)
+            t = torch.randint(0, max_t, (b,), device=device)
+            
+            noise = torch.randn_like(x_0)
+            x_t = self.q_sample(x_0, t, noise)
+            
+            # Forward pass with conditioning
+            use_conditioning = bool(self.config.get("use_conditioning", True))
+            
+            if self.mixed_precision and torch.cuda.is_available():
+                with torch.cuda.amp.autocast(dtype=self.autocast_dtype):
+                    if use_conditioning:
+                        try:
+                            noise_pred = self.model(x_t, t, cond=c_wf)
+                        except TypeError:
+                            noise_pred = self.model(x_t, t)
+                    else:
+                        noise_pred = self.model(x_t, t)
+                    
+                    # Main DDPM loss
+                    ddpm_loss = F.mse_loss(noise_pred, noise)
+                    total_loss = ddpm_loss
+                    
+                    # Cross-resolution consistency loss
+                    if self.cross_resolution_consistency and self.current_phase > 0:
+                        consistency_loss = self._compute_cross_resolution_consistency(
+                            x_0, x_t, t, noise_pred, current_resolution
+                        )
+                        total_loss = total_loss + config["consistency_weight"] * consistency_loss
+                        self._log_if_trainer("train/consistency_loss", consistency_loss)
+                    
+                    # Optional supervised x0 loss
+                    if self.config.get("supervised_x0_weight", 0.0) > 0:
+                        alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+                        sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
+                        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
+                        x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                        loss_x0 = F.l1_loss(x0_hat, x_0)
+                        total_loss = total_loss + float(self.config.get("supervised_x0_weight", 0.0)) * loss_x0
+            else:
+                # Standard precision training
+                if use_conditioning:
+                    try:
+                        noise_pred = self.model(x_t, t, cond=c_wf)
+                    except TypeError:
+                        noise_pred = self.model(x_t, t)
+                else:
+                    noise_pred = self.model(x_t, t)
+                
+                ddpm_loss = F.mse_loss(noise_pred, noise)
+                total_loss = ddpm_loss
+                
+                # Cross-resolution consistency loss
+                if self.cross_resolution_consistency and self.current_phase > 0:
+                    consistency_loss = self._compute_cross_resolution_consistency(
+                        x_0, x_t, t, noise_pred, current_resolution
+                    )
+                    total_loss = total_loss + config["consistency_weight"] * consistency_loss
+                    self._log_if_trainer("train/consistency_loss", consistency_loss)
+                
+                # Optional supervised x0 loss
+                if self.config.get("supervised_x0_weight", 0.0) > 0:
+                    alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+                    sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
+                    sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
+                    x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                    loss_x0 = F.l1_loss(x0_hat, x_0)
+                    total_loss = total_loss + float(self.config.get("supervised_x0_weight", 0.0)) * loss_x0
+        else:
+            # Fallback to parent implementation
+            total_loss = super().training_step(batch, batch_idx)
+        
+        # Track statistics for adaptive curriculum
+        self.phase_stats["losses"].append(total_loss.item())
         
         # Log progressive training info
         if self.enable_progressive:
-            config = self.get_current_resolution_config()
             self._log_if_trainer("progressive/resolution", config["resolution"])
             self._log_if_trainer("progressive/phase", config["phase"])
             self._log_if_trainer("progressive/transition_alpha", self.model.transition_alpha)
+            self._log_if_trainer("progressive/timesteps", config["timesteps"])
+            self._log_if_trainer("progressive/lr_scale", config["lr_scale"])
+            self._log_if_trainer("train/ddpm_loss", ddpm_loss if 'ddmp_loss' in locals() else total_loss)
         
-        return loss
+        # Update EMA
+        if self.use_ema and self.global_step % 10 == 0:
+            self._update_ema()
+        
+        # Advance step counter
+        if not hasattr(self, "_global_step"):
+            self._global_step = 0
+        self._global_step += 1
+        
+        return total_loss
     
     def configure_optimizers(self):
         """Configure optimizers with progressive learning rate."""
@@ -316,6 +511,100 @@ class ProgressiveTrainer(DDPMTrainer):
                   f"Phase {config['phase'] + 1}/{config['total_phases']}, "
                   f"Alpha {self.model.transition_alpha:.3f}")
     
+    def _compute_cross_resolution_consistency(
+        self, 
+        x_0: torch.Tensor, 
+        x_t: torch.Tensor, 
+        t: torch.Tensor, 
+        noise_pred: torch.Tensor,
+        current_resolution: int
+    ) -> torch.Tensor:
+        """Compute cross-resolution consistency loss.
+        
+        This encourages the model to produce consistent features across different resolutions.
+        """
+        if self.current_phase == 0:
+            return torch.tensor(0.0, device=x_0.device)
+        
+        # Get previous resolution
+        prev_resolution = self.resolution_schedule[self.current_phase - 1]
+        
+        # Downsample current prediction to previous resolution
+        with torch.no_grad():
+            # Predict x0 from current noise prediction
+            alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+            sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
+            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
+            x0_pred_current = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+            x0_pred_current = torch.clamp(x0_pred_current, -1.0, 1.0)
+            
+            # Downsample to previous resolution
+            x0_pred_downsampled = F.interpolate(
+                x0_pred_current, 
+                size=(prev_resolution, prev_resolution),
+                mode='bilinear', 
+                align_corners=False
+            )
+            
+            # Upsample back to current resolution
+            x0_pred_upsampled = F.interpolate(
+                x0_pred_downsampled,
+                size=(current_resolution, current_resolution),
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        # Compute consistency loss (should be similar after down/up sampling)
+        consistency_loss = self.feature_consistency_loss(x0_pred_current, x0_pred_upsampled)
+        
+        return consistency_loss
+    
+    def _compute_convergence_rate(self, window_size: int = 100) -> float:
+        """Compute convergence rate for adaptive curriculum."""
+        if len(self.phase_stats["losses"]) < window_size:
+            return 0.0
+        
+        recent_losses = self.phase_stats["losses"][-window_size:]
+        if len(recent_losses) < 2:
+            return 0.0
+        
+        # Compute rate of change in loss
+        early_avg = sum(recent_losses[:window_size//2]) / (window_size//2)
+        late_avg = sum(recent_losses[window_size//2:]) / (window_size//2)
+        
+        if early_avg == 0:
+            return 0.0
+        
+        convergence_rate = abs(early_avg - late_avg) / early_avg
+        return convergence_rate
+    
+    def should_advance_phase_adaptive(self, epoch: int, phase_start_epoch: int) -> bool:
+        """Adaptive phase advancement based on convergence."""
+        if not self.enable_progressive:
+            return False
+        
+        # Check minimum epochs first
+        epochs_in_phase = epoch - phase_start_epoch
+        min_epochs = max(5, self.epochs_per_resolution[self.current_phase] // 2)
+        
+        if epochs_in_phase < min_epochs:
+            return False
+        
+        # Check maximum epochs
+        max_epochs = self.epochs_per_resolution[self.current_phase]
+        if epochs_in_phase >= max_epochs:
+            return True
+        
+        # Check convergence rate
+        convergence_rate = self._compute_convergence_rate()
+        convergence_threshold = 0.01  # 1% change threshold
+        
+        if convergence_rate < convergence_threshold and epochs_in_phase >= min_epochs:
+            print(f"🎯 Early advancement: convergence rate {convergence_rate:.4f} below threshold")
+            return True
+        
+        return False
+    
     def get_progressive_summary(self) -> Dict[str, Any]:
         """Get summary of progressive training state."""
         if not self.enable_progressive:
@@ -323,7 +612,7 @@ class ProgressiveTrainer(DDPMTrainer):
         
         config = self.get_current_resolution_config()
         
-        return {
+        summary = {
             "progressive_enabled": True,
             "current_phase": self.current_phase,
             "total_phases": len(self.resolution_schedule),
@@ -334,8 +623,20 @@ class ProgressiveTrainer(DDPMTrainer):
             "smooth_transitions": self.smooth_transitions,
             "lr_scaling": self.lr_scaling,
             "batch_scaling": self.batch_scaling,
+            "adaptive_batch_scaling": self.adaptive_batch_scaling,
+            "cross_resolution_consistency": self.cross_resolution_consistency,
             "model_info": self.model.get_progressive_info()
         }
+        
+        # Add convergence statistics
+        if len(self.phase_stats["losses"]) > 0:
+            summary.update({
+                "convergence_rate": self._compute_convergence_rate(),
+                "recent_avg_loss": sum(self.phase_stats["losses"][-10:]) / min(10, len(self.phase_stats["losses"])),
+                "total_training_steps": len(self.phase_stats["losses"])
+            })
+        
+        return summary
 
 
 class ProgressiveDataLoader:

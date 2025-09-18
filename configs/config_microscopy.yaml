@@ -17,7 +17,7 @@ experiment:
 # Path configuration
 paths:
   root: ${oc.env:PROJECT_ROOT,.}
-  data: /global/scratch/users/anna_yoon/real_microscopy
+  data: ${paths.root}/data/real_microscopy  # Access to 128x128 patch dataset
   checkpoints: ${paths.root}/checkpoints
   outputs: ${paths.root}/outputs
   logs: ${paths.root}/logs
@@ -28,7 +28,7 @@ wandb:
   entity: anna_yoon-uc-berkeley  # Auto-configured from system credentials
   mode: offline  # Default to offline for HPC clusters
 
-# Model configuration - Optimized for 128x128 microscopy images (proven on single A40)
+# Model configuration - Multi-resolution training with progressive schedule [16, 32, 64, 128]
 model:
   sample_size: 128
   in_channels: 1  # Will be set to 2 automatically if use_conditioning=true
@@ -39,6 +39,34 @@ model:
   up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"]
   class_embed_type: null
   cross_attention_dim: null
+  
+  # Multi-Resolution Training Configuration
+  multi_resolution:
+    enabled: true                   # Enable progressive training
+    strategy: "hierarchical"        # hierarchical, progressive, cascaded
+    
+    # Resolution curriculum - Progressive resolution schedule
+    resolutions: [32, 64, 96, 128]  # Progressive resolution schedule [32, 64, 96, 128]
+    base_resolution: 32             # Starting resolution
+    target_resolution: 128          # Final target resolution
+    
+    # Progressive training features
+    progressive:
+      enabled: true                 # Use ProgressiveTrainer class
+      max_resolution: 128           # Maximum resolution
+      curriculum_type: "exponential" # linear, exponential, adaptive
+      epochs_per_resolution: [30, 40, 50, 80]  # Progressive epochs: 32→64→96→128
+      
+      # Smooth transitions
+      smooth_transitions: true      # Alpha-blending between resolutions
+      transition_epochs: 3          # Epochs for smooth transitions
+      blend_mode: "alpha"           # alpha, feature, loss
+      
+      # Adaptive features
+      lr_scaling: true              # Scale learning rate with resolution
+      lr_curriculum: "sqrt"         # sqrt, linear, constant
+      batch_scaling: true           # Adaptive batch scaling
+      adaptive_batch_scaling: true  # Memory-aware batch scaling
 
 # Training configuration - Optimized for self-supervised microscopy learning
 training:
@@ -49,11 +77,10 @@ training:
   learning_rate: 1.0e-4         # Stable learning rate for diffusion models
   weight_decay: 1.0e-6          # L2 regularization
   
-  # Batch and memory settings - Optimized for 4x A40 with 128x128 images
-  batch_size: 32                # Per GPU batch size (total effective = 32*4 = 128) - Same as single A40
-  num_workers: 32               # Total workers across all GPUs
-                                # Rule: num_workers = total_cpus = 32
-  accumulate_grad_batches: 3    # Effective batch size = 32 * 4 * 3 = 384 (very large for multi-GPU)
+  # Batch and memory settings - Optimized for single A40 GPU
+  batch_size: 32                # Per GPU batch size (good for A40)
+  num_workers: 16               # Workers for single GPU (adjust based on CPU cores)
+  accumulate_grad_batches: 4    # Effective batch size = 32 * 4 = 128 (optimal for single A40)
   gradient_clip: 1.0            # Gradient clipping for stability
   
   # Memory optimization - Tuned for A40 (46GB VRAM)
@@ -97,16 +124,42 @@ training:
   log_every_n_steps: 100        # Log metrics every 100 steps
   
   # Advanced training options
-  steps_per_epoch: 549          # Optimized for batch size 32 (549 * 32 * 4 = 70,272 samples/epoch)
+  steps_per_epoch: 263          # Corrected: 33,635 samples ÷ 128 effective batch size = 263 steps/epoch
   precision: 16-mixed           # Mixed precision training
   
-# Data configuration
+# Data configuration - 128x128 patches with 16-bit support
 data:
-  image_size: 128               # Image size for training (same as proven A40GPU config)
-  min_intensity: 0              # Minimum intensity value
-  max_intensity: 255            # Maximum intensity value (adjust based on your data)
-  noise_model: poisson          # poisson, gaussian, poisson_gaussian
+  image_size: 128               # 128x128 patches from frame-based splits
+  min_intensity: 0              # Minimum intensity value (16-bit)
+  max_intensity: 65535          # Maximum intensity value (16-bit range)
+  noise_model: poisson          # Poisson noise model for microscopy
+  use_16bit_normalization: true # Proper 16-bit normalization
+  align_pairs: true             # Align WF to 2P images
+  use_self_supervised: true     # Use self-supervised learning with forward model
   use_zarr: false               # Set to true for very large datasets
+  
+  # Multi-resolution Data Pipeline
+  data_loading:
+    # Standard data loading
+    use_zarr: false               # Use standard image loading
+    cache_dataset: true           # Enable dataset caching for efficiency
+    
+    # Multi-resolution data pipeline
+    multi_resolution:
+      enabled: true               # Use ProgressiveDataLoader
+      precompute_scales: true     # Pre-compute resolution versions
+      interpolation_method: "lanczos"  # High-quality interpolation
+      preserve_aspect_ratio: true # Maintain aspect ratios
+      
+      # Resolution-specific augmentations
+      scale_specific_augmentation:
+        enabled: true
+        low_res_augmentations:    # Stronger augmentation for low-res
+          noise_std: 0.1
+          blur_probability: 0.3
+        high_res_augmentations:   # Gentler augmentation for high-res
+          noise_std: 0.05
+          blur_probability: 0.1
   
   # Generalized Anscombe Transform parameters (for poisson_gaussian noise)
   gat:
@@ -114,18 +167,21 @@ data:
     mu: 0.0                     # Gaussian mean
     sigma: 0.0                  # Gaussian standard deviation
 
-# PSF configuration for self-supervised cycle consistency
+# PSF configuration for self-supervised cycle consistency - 2μm bead
 psf:
   type: gaussian                # Type of PSF (gaussian, file, measured)
-  sigma_x: 2.0                  # Standard deviation in x direction (adjust for your system)
-  sigma_y: 2.0                  # Standard deviation in y direction
+  sigma_x: 2.0                  # Standard deviation in x direction (2μm bead)
+  sigma_y: 2.0                  # Standard deviation in y direction (2μm bead)
   size: 21                      # PSF kernel size (should be odd)
   background: 0.0               # Background intensity level
 
 # Physics configuration
 physics:
-  psf_type: gaussian
-  psf_size: 21
+  use_psf: true
+  use_bead_psf: true
+  beads_dir: ${paths.data}/beads  # Use 2μm bead PSF from data/real_microscopy/beads/
+  bead_mode: with_AO  # Use the AO-corrected PSF
+  psf_type: measured  # Use measured PSF from beads
   background: 0.0
   noise_type: poisson
 
@@ -154,12 +210,12 @@ inference:
   batch_size: 4                 # Inference batch size
   guidance_scale: 1.0           # Guidance scale for sampling
 
-# Hardware optimization - Multi-GPU setup
+# Hardware optimization - Single A40 GPU setup
 hardware:
-  devices: 4                    # Number of GPUs (4x A40)
+  devices: 1                    # Single A40 GPU
   accelerator: gpu              # gpu, cpu, tpu
-  strategy: ddp                 # Distributed Data Parallel for multi-GPU
-  sync_batchnorm: true          # Synchronize batch norm across devices
+  strategy: auto                # Auto strategy for single GPU
+  sync_batchnorm: false         # Not needed for single GPU
   
 # Logging and monitoring
 logging:

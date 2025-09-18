@@ -14,7 +14,6 @@ Commands:
     preprocess  - Preprocess data
     baseline    - Run baseline methods
     util        - Utility operations
-    sid         - SID dataset operations (download, evaluate)
 
 Examples:
     python scripts/main.py train --config configs/training/microscopy.yaml
@@ -120,7 +119,7 @@ def create_training_parser(subparsers):
     
     parser.add_argument(
         '--dataset', '-d',
-        choices=['microscopy', 'imagenet', 'mnist'],
+        choices=['microscopy'],
         default='microscopy',
         help='Dataset to train on'
     )
@@ -323,38 +322,6 @@ def create_util_parser(subparsers):
     return parser
 
 
-def create_sid_parser(subparsers):
-    """Create SID (See-in-the-Dark) command parser."""
-    parser = subparsers.add_parser(
-        'sid',
-        help='SID dataset operations',
-        description='Download, evaluate, and manage SID (See-in-the-Dark) dataset for cross-domain generalization'
-    )
-    
-    parser.add_argument(
-        '--task',
-        choices=['download', 'evaluate', 'check'],
-        required=True,
-        help='SID task to perform'
-    )
-    
-    # Common arguments
-    parser.add_argument('--data-dir', default='data/SID', help='SID dataset directory')
-    parser.add_argument('--camera', choices=['Sony', 'Fuji'], default='Sony', help='Camera type')
-    
-    # Evaluation-specific arguments
-    parser.add_argument('--checkpoint', help='Model checkpoint for evaluation')
-    parser.add_argument('--guidance-types', nargs='+', choices=['pkl', 'l2', 'anscombe'],
-                       default=['pkl'], help='Guidance strategies for evaluation')
-    parser.add_argument('--max-images', type=int, help='Maximum images to evaluate')
-    parser.add_argument('--output-dir', help='Output directory for results')
-    
-    # Download-specific arguments
-    parser.add_argument('--force', action='store_true', help='Force re-download')
-    
-    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
-    
-    return parser
 
 
 def handle_training_command(args, runner: ScriptRunner) -> int:
@@ -367,12 +334,8 @@ def handle_training_command(args, runner: ScriptRunner) -> int:
         if args.config:
             script_args.extend(['--config', args.config])
     else:
-        # Natural images (imagenet, mnist, cifar, etc.)
-        script_name = "run_natural.py"
-        script_args = ['--mode', 'train', '--dataset', args.dataset]
-        
-        if args.config:
-            script_args.extend(['--config', args.config])
+        # Only microscopy supported now
+        raise ValueError(f"Dataset '{args.dataset}' not supported. Only 'microscopy' is available.")
     
     script_path = runner.scripts_dir / script_name
     
@@ -548,90 +511,6 @@ def handle_util_command(args, runner: ScriptRunner) -> int:
         return 1
 
 
-def handle_sid_command(args, runner: ScriptRunner) -> int:
-    """Handle SID (See-in-the-Dark) dataset command."""
-    if args.task == 'download':
-        print("📥 Downloading SID dataset")
-        # Use the dataset module to download SID data
-        try:
-            from pkl_dg.data import download_sid_dataset
-            data_dir = args.data_dir or 'data/SID'
-            camera = args.camera or 'Sony'
-            
-            success = download_sid_dataset(data_dir, camera, force=args.force)
-            if success:
-                print(f"✅ {camera} SID dataset downloaded successfully to {data_dir}")
-                return 0
-            else:
-                print(f"❌ Failed to download {camera} SID dataset")
-                return 1
-        except ImportError as e:
-            print(f"❌ Error importing download function: {e}")
-            return 1
-    
-    elif args.task == 'evaluate':
-        print("🔬 Evaluating on SID dataset for cross-domain generalization")
-        
-        # Required arguments
-        if not args.checkpoint:
-            print("❌ Checkpoint required for evaluation")
-            return 1
-        
-        # Use the unified evaluation system as a Python module
-        cmd = [sys.executable, '-m', 'pkl_dg.evaluation']
-        cmd.extend([
-            '--config-name', 'evaluation/sid_evaluation',
-            f'model.checkpoint_path={args.checkpoint}',
-            f'processing.sid_camera_type={args.camera}',
-            f'processing.sid_data_dir={args.data_dir}'
-        ])
-        
-        # Optional arguments
-        if args.guidance_types:
-            guidance_str = '[' + ','.join(args.guidance_types) + ']'
-            cmd.append(f'processing.sid_guidance_types={guidance_str}')
-        if args.max_images:
-            cmd.append(f'processing.max_images={args.max_images}')
-        if args.output_dir:
-            cmd.append(f'inference.output_dir={args.output_dir}')
-        
-        print(f"🚀 Running: {' '.join(cmd)}")
-        
-        try:
-            import subprocess
-            result = subprocess.run(cmd, check=False)
-            return result.returncode
-        except Exception as e:
-            print(f"❌ Error running evaluation: {e}")
-            return 1
-    
-    elif args.task == 'check':
-        print("✅ Checking SID dataset")
-        # Use the dataset module to check SID data
-        try:
-            from pkl_dg.data import SIDDataset
-            data_dir = args.data_dir or 'data/SID'
-            camera = args.camera or 'Sony'
-            
-            try:
-                # Try to create dataset to check if data exists
-                dataset = SIDDataset(data_dir=data_dir, camera_type=camera)
-                print(f"✅ {camera} SID dataset found in {data_dir}")
-                print(f"   Found {len(dataset)} image pairs")
-                return 0
-            except (FileNotFoundError, RuntimeError, Exception) as e:
-                print(f"❌ {camera} SID dataset not found in {data_dir}")
-                print(f"   Error: {e}")
-                print(f"💡 To download: python scripts/main.py sid --task download --camera {camera}")
-                return 1
-        except ImportError as e:
-            print(f"❌ Error importing SID dataset: {e}")
-            return 1
-    
-    else:
-        print(f"❌ Unknown SID task: {args.task}")
-        print("Available tasks: download, evaluate, check")
-        return 1
 
 
 def list_available_scripts(runner: ScriptRunner):
@@ -691,7 +570,6 @@ def main():
     create_preprocess_parser(subparsers)
     create_baseline_parser(subparsers)
     create_util_parser(subparsers)
-    create_sid_parser(subparsers)
     
     # Parse arguments
     args = parser.parse_args()
@@ -729,11 +607,9 @@ def main():
             return handle_baseline_command(args, runner)
         elif args.command == 'util':
             return handle_util_command(args, runner)
-        elif args.command == 'sid':
-            return handle_sid_command(args, runner)
         else:
             print(f"❌ Unknown command: {args.command}")
-            print("Available commands: train, evaluate, preprocess, baseline, util, sid")
+            print("Available commands: train, evaluate, preprocess, baseline, util")
             return 1
             
     except KeyboardInterrupt:

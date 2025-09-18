@@ -11,12 +11,19 @@ experiment:
   name: "unified_evaluation"
   output_dir: "outputs/unified_evaluation"
 
-# Data configuration
+# Data configuration - Multi-resolution evaluation support
 data:
-  image_size: 256
+  image_size: 128                   # Target resolution matching training
   min_intensity: 0.0
   max_intensity: 1.0
   noise_model: "poisson"  # gaussian, poisson, poisson_gaussian
+  
+  # Multi-resolution evaluation settings
+  multi_resolution:
+    enabled: true                   # Enable multi-resolution evaluation
+    resolutions: [32, 64, 96, 128]  # Progressive resolution schedule [32, 64, 96, 128]
+    evaluate_all_scales: true       # Evaluate at all resolution levels
+  
   gat:
     alpha: 1.0
     mu: 0.0
@@ -82,12 +89,18 @@ inference:
   use_autocast: true
   batch_size: 1
 
-# Processing configuration - NEW for unified system
+# Processing configuration - Multi-resolution unified system
 processing:
   # Patch processing parameters
-  patch_size: 256
-  stride: 128
+  patch_size: 128                   # Match target resolution
+  stride: 64                        # Half of patch size
   feather_size: null  # Auto-computed as stride//2
+  
+  # Multi-resolution processing
+  multi_resolution_patches:
+    enabled: true                   # Enable multi-resolution patch processing
+    patch_sizes: [32, 64, 96, 128]  # Progressive patch sizes [32, 64, 96, 128]
+    strides: [16, 32, 48, 64]       # Corresponding strides
   
   # General processing
   max_images: null  # Process all images, or set to limit

@@ -280,8 +280,8 @@ from typing import Optional, Tuple
 import numpy as np
 from PIL import Image
 
-class SynthesisDataset(Dataset):
-    """Dataset for synthesizing training pairs from ImageNet-like sources."""
+class ExternalDataset(Dataset):
+    """Dataset for synthesizing training pairs from external sources."""
     
     def __init__(
         self,
@@ -1335,7 +1335,7 @@ import wandb
 
 from pkl_dg.models.unet import DenoisingUNet
 from pkl_dg.models.diffusion import DDPMTrainer
-from pkl_dg.data.synthesis import SynthesisDataset
+from pkl_dg.data import RealPairsDataset
 from pkl_dg.data.transforms import IntensityToModel
 from pkl_dg.physics.psf import PSF
 from pkl_dg.physics.forward_model import ForwardModel
@@ -1378,16 +1378,16 @@ def train(cfg: DictConfig):
     )
     
     # Create datasets
-    train_dataset = SynthesisDataset(
-        source_dir=f"{data_dir}/train",
+    train_dataset = RealPairsDataset(
+        root_dir=f"{data_dir}/train",
         forward_model=forward_model,
         transform=transform,
         image_size=cfg.data.image_size,
         mode='train'
     )
     
-    val_dataset = SynthesisDataset(
-        source_dir=f"{data_dir}/val",
+    val_dataset = RealPairsDataset(
+        root_dir=f"{data_dir}/val",
         forward_model=forward_model,
         transform=transform,
         image_size=cfg.data.image_size,
@@ -1672,12 +1672,12 @@ pip install -e .
 ### 1. Prepare Data
 
 ```bash
-# Download ImageNet subset
+# Download external image data
 python scripts/download_data.py --data-dir data/
 
 # Synthesize training data
 python scripts/synthesize_data.py \
-    --source-dir data/imagenet \
+    --source-dir data/external_images \
     --output-dir data/synthesized \
     --psf assets/psf/measured_psf.tif
 ```

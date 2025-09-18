@@ -11,14 +11,14 @@ import importlib.util
 # Import from the actual evaluation module - use the metrics.py file directly
 spec = importlib.util.spec_from_file_location(
     "metrics_module", 
-    Path(__file__).parent.parent / "pkl_dg" / "evaluation" / "metrics.py"
+    Path(__file__).parent.parent / "pkl_dg" / "metrics.py"
 )
 metrics_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(metrics_module)
 Metrics = metrics_module.Metrics
 
 # For compute_metrics, use the registry system
-from pkl_dg.evaluation.evaluation import compute_metrics
+from pkl_dg.evaluation import compute_metrics
 
 
 class TestMetricsRegistry:

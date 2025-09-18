@@ -77,12 +77,12 @@ pip install -e .
 ### 1. Prepare Data
 
 ```bash
-# Download ImageNet subset
+# Download external image data
 python scripts/download_data.py --data-dir data/
 
 # Synthesize training data
 python scripts/synthesize_data.py \
-    --source-dir data/imagenet \
+    --source-dir data/external_images \
     --output-dir data/synthesized \
     --psf assets/psf/measured_psf.tif
 ```
