@@ -189,8 +189,8 @@ def create_evaluation_parser(subparsers):
     
     parser.add_argument(
         '--baseline',
-        choices=['rl', 'rcan', 'all'],
-        help='Run baseline comparison'
+        choices=['rl'],
+        help='Run Richardson–Lucy baseline comparison'
     )
     
     parser.add_argument(

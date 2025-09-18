@@ -57,6 +57,8 @@ model:
       enabled: true                 # Use ProgressiveTrainer class
       max_resolution: 128           # Maximum resolution
       curriculum_type: "exponential" # linear, exponential, adaptive
+      # Explicit resolution schedule passed to trainer
+      resolution_schedule: [32, 64, 96, 128]
       steps_per_resolution: [200000, 250000, 300000, 250000]  # Progressive steps: 32→64→96→128 (1M total)
       
       # Smooth transitions
@@ -76,7 +78,7 @@ training:
   max_steps: 1000000            # 1 Million steps (much better for diffusion models)
   max_epochs: -1                # Disable epoch limit (step-based training)
   num_timesteps: 1000           # Diffusion timesteps (1000 is optimal for quality)
-  beta_schedule: cosine         # cosine schedule works better than linear
+  beta_schedule: cosine         # improved DDPM-style schedule
   learning_rate: 7.5e-5         # Slightly lower LR for stability
   weight_decay: 1.0e-6          # L2 regularization
   
@@ -221,12 +223,12 @@ data:
   use_16bit_normalization: true # Proper 16-bit normalization
   align_pairs: true             # Align WF to 2P images
   use_self_supervised: true     # Use self-supervised learning with forward model
-  use_zarr: false               # Set to true for very large datasets
+  
   
   # Multi-resolution Data Pipeline
   data_loading:
     # Standard data loading
-    use_zarr: false               # Use standard image loading
+    
     cache_dataset: true           # Enable dataset caching for efficiency
     
     # Multi-resolution data pipeline
@@ -272,8 +274,9 @@ physics:
 
 # Guidance configuration
 guidance:
-  type: pkl                     # pkl, l2, anscombe
-  epsilon: 1e-6                 # Guidance strength
+  type: pkl                     # pkl, kl, l2, anscombe
+  epsilon: 1e-6                 # Guidance epsilon (for pkl/anscombe)
+  sigma2: 1.0                   # KL guidance variance (for kl)
   schedule_type: adaptive       # adaptive, linear, constant
   lambda_base: 0.1              # Base guidance weight
   schedule:

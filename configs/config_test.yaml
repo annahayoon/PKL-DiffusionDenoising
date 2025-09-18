@@ -11,14 +11,14 @@ defaults:
 experiment:
   name: microscopy_test_${now:%Y-%m-%d_%H-%M-%S}
   seed: 42
-  device: cuda
-  mixed_precision: true
+  device: cpu
+  mixed_precision: false
 
 # Paths
 paths:
-  code_root: /global/home/users/anna_yoon/PKL-DiffusionDenoising
-  data_root: /global/scratch/users/anna_yoon
-  data: ${paths.data_root}/data
+  code_root: /home/jilab/anna_OS_ML/PKL-DiffusionDenoising
+  data_root: /home/jilab/anna_OS_ML/PKL-DiffusionDenoising
+  data: ${paths.data_root}/data/real_microscopy
   checkpoints: ${paths.data_root}/checkpoints
   outputs: ${paths.data_root}/outputs
   logs: ${paths.data_root}/logs
@@ -41,6 +41,18 @@ model:
   class_embed_type: null
   cross_attention_dim: null
   learned_variance: true
+
+  # Multi-Resolution Training Configuration (explicit schedule for tests)
+  multi_resolution:
+    enabled: true
+    base_resolution: 32
+    target_resolution: 128
+    resolutions: [32, 64, 128]
+    progressive:
+      enabled: true
+      max_resolution: 128
+      curriculum_type: "linear"
+      resolution_schedule: [32, 64, 128]
 
 # Training configuration (smaller for fast iteration)
 training:
@@ -106,19 +118,19 @@ training:
           mode: "min"
 
   # Validation/logging (more frequent for tests)
-  val_check_interval: 1.0
+  val_check_interval: 1
   log_every_n_steps: 10
   save_every_n_epochs: 1
   limit_val_batches: 1.0
 
   # Perf (disable compile to reduce startup time in test runs)
-  precision: "16-mixed"
+  precision: "32-true"
   compile_model: false
-  use_fused_adam: true
+  use_fused_adam: false
   benchmark: true
 
   # Memory safety
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   max_memory_usage: 0.85
 
   # Early stopping (not strict for short tests)
@@ -140,7 +152,22 @@ training:
 
   # Advanced options
   steps_per_epoch: 100
-  dataloader_pin_memory_device: "cuda"
+  dataloader_pin_memory_device: null
+
+  # Micro-checkpoint test configuration
+  checkpoint_config:
+    main_checkpoint:
+      every_n_train_steps: 2
+      save_top_k: -1
+      monitor: "val/loss"
+      mode: "min"
+      filename: "ddpm-{step:06d}-{val/loss:.4f}"
+      save_last: true
+    intermediate_checkpoint:
+      every_n_train_steps: 1
+      save_top_k: -1
+      filename: "ddpm-intermediate-{step:06d}"
+      save_last: false
 
 # Data
 data:
@@ -151,9 +178,16 @@ data:
   use_16bit_normalization: true
   align_pairs: true
   use_self_supervised: true
-  use_zarr: false
+  
+  # Enable ProgressiveDataLoader for tests
   data_loading:
-    use_zarr: false
+    multi_resolution:
+      enabled: true
+      precompute_scales: false
+      interpolation_method: "bilinear"
+  
+  data_loading:
+    
     cache_dataset: true
 
 # PSF/Physics
@@ -201,7 +235,7 @@ inference:
 # Hardware
 hardware:
   devices: 1
-  accelerator: gpu
+  accelerator: cpu
   strategy: auto
   sync_batchnorm: false
 
@@ -214,13 +248,13 @@ logging:
 
 # Optimization flags
 optimization:
-  channels_last: true
-  benchmark_cudnn: true
+  channels_last: false
+  benchmark_cudnn: false
   deterministic: false
-  memory_efficient_attention: true
-  gradient_checkpointing: true
-  use_gradient_checkpointing: true
-  use_tf32: true
+  memory_efficient_attention: false
+  gradient_checkpointing: false
+  use_gradient_checkpointing: false
+  use_tf32: false
   torch_compile_mode: "default"
 
 

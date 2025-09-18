@@ -1,6 +1,6 @@
 import torch
 
-from pkl_dg.guidance import PKLGuidance, L2Guidance, AnscombeGuidance, AdaptiveSchedule
+from pkl_dg.guidance import PKLGuidance, KLGuidance, L2Guidance, AnscombeGuidance, AdaptiveSchedule
 from pkl_dg.physics import ForwardModel
 
 
@@ -35,6 +35,21 @@ def test_l2_guidance_shapes_and_basic_behavior():
     assert torch.isfinite(grad).all()
 
 
+@torch.no_grad()
+def test_l2_guidance_direction_alignment():
+    device = "cpu"
+    fm = _make_forward_model(device)
+    guide = L2Guidance()
+    x = torch.rand(2, 1, 32, 32, device=device)
+    y = torch.rand_like(x) + 0.05
+    g = guide.compute_gradient(x, y, fm, t=50)
+    AxB = fm.apply_psf(x) + fm.background
+    residual = y - AxB
+    # Check that projected gradient aligns with residual on average
+    inner = (fm.apply_psf(g) * residual).mean().item()
+    assert inner >= -1e-4
+
+
 def test_anscombe_guidance_shapes_and_finiteness():
     device = "cpu"
     fm = _make_forward_model(device)
@@ -44,6 +59,22 @@ def test_anscombe_guidance_shapes_and_finiteness():
     grad = guide.compute_gradient(x, y, fm, t=100)
     assert grad.shape == x.shape
     assert torch.isfinite(grad).all()
+
+
+@torch.no_grad()
+def test_kl_guidance_shapes_and_direction():
+    device = "cpu"
+    fm = _make_forward_model(device)
+    guide = KLGuidance(sigma2=1.0)
+    x = torch.rand(2, 1, 32, 32, device=device)
+    y = torch.rand_like(x) + 0.1
+    g = guide.compute_gradient(x, y, fm, t=100)
+    assert g.shape == x.shape
+    assert torch.isfinite(g).all()
+    AxB = fm.apply_psf(x) + fm.background
+    residual = AxB - y  # KL gradient uses (Ax+B - y)
+    inner = (fm.apply_psf(g) * residual).mean().item()
+    assert inner >= -1e-4
 
 
 def test_adaptive_schedule_lambda_scaling():

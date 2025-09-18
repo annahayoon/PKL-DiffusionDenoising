@@ -168,6 +168,12 @@ class UNet(nn.Module):
         
         # Memory optimization settings
         self.gradient_checkpointing = config.get("gradient_checkpointing", False)
+        # Respect channels-last memory format if requested
+        if bool(config.get("channels_last", False)):
+            try:
+                self.to(memory_format=torch.channels_last)
+            except Exception:
+                pass
         self.memory_efficient_attention = config.get("memory_efficient_attention", True)
         
         # Enable memory optimizations if requested
@@ -208,6 +214,7 @@ class UNet(nn.Module):
         return denormalize_model_output_to_16bit(x)
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, 
+                cond: Optional[torch.Tensor] = None,
                 normalize_input: bool = True, denormalize_output: bool = False) -> torch.Tensor:
         """Forward pass with optional 16-bit normalization.
         
@@ -223,6 +230,8 @@ class UNet(nn.Module):
         # Normalize 16-bit input to model range if requested
         if normalize_input:
             x = self.normalize_input(x)
+            if cond is not None:
+                cond = self.normalize_input(cond)
         
         # Time embedding (only for diffusion mode)
         if self.use_time_conditioning:
@@ -232,8 +241,24 @@ class UNet(nn.Module):
         else:
             time_emb = None
         
+        # Concatenate conditioner channel if provided, else pad if model expects more channels
+        if cond is not None:
+            # Ensure spatial size match
+            if cond.shape[-2:] != x.shape[-2:]:
+                cond = F.interpolate(cond, size=x.shape[-2:], mode='bilinear', align_corners=False)
+            x_in = torch.cat([x, cond], dim=1)
+        else:
+            # If model was configured with extra channels (e.g., 2) but no conditioner provided, pad zeros
+            expected_c = int(self.in_channels)
+            if x.shape[1] < expected_c:
+                pad_c = expected_c - x.shape[1]
+                zeros = torch.zeros(x.shape[0], pad_c, x.shape[2], x.shape[3], device=x.device, dtype=x.dtype)
+                x_in = torch.cat([x, zeros], dim=1)
+            else:
+                x_in = x
+        
         # Input projection
-        h = self.conv_in(x)
+        h = self.conv_in(x_in)
         
         # Down path with gradient checkpointing support
         skip_connections = []

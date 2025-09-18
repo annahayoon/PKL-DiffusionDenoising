@@ -29,7 +29,7 @@ Anonymous Institution}
 
 % --- Abstract ---
 \begin{abstract}
-Denoising diffusion models for inverse problems often enforce measurement consistency via an L$_2$ penalty, implicitly assuming homoscedastic Gaussian noise. In photon-limited microscopy, noise is fundamentally Poisson, making L$_2$ guidance statistically mismatched. We introduce Poisson-Kullback--Leibler (PKL) guidance, a physically grounded, adaptive update derived from the Poisson likelihood that integrates a measured forward model (PSF convolution and background). Our framework operates on real grayscale microscopy data with measured PSFs and detector backgrounds; no synthetic training is used. We provide a rigorous evaluation against strong baselines, including Anscombe-stabilized L$_2$ and Richardson--Lucy deconvolution, and conduct extensive ablations (guidance type/strength schedules, PSF sources, and model options). Placeholders for quantitative results and figures are included; code will be released at submission to ensure reproducibility.
+Denoising diffusion models for inverse problems often enforce measurement consistency via an L$_2$ penalty, implicitly assuming homoscedastic Gaussian noise. In photon-limited microscopy, noise is fundamentally Poisson, making L$_2$ guidance statistically mismatched. We introduce Poisson-Kullback--Leibler (PKL) guidance, a physically grounded, adaptive update derived from the Poisson likelihood that integrates a measured forward model (PSF convolution and background) and optionally accounts for read noise. Our framework operates on real grayscale microscopy data with measured PSFs and detector backgrounds; no synthetic training is used. We provide a rigorous evaluation against strong baselines, including Anscombe-stabilized L$_2$ and Richardson--Lucy deconvolution, and conduct extensive ablations (guidance type/strength schedules, PSF sources, and model options). Placeholders for quantitative results and figures are included; code will be released at submission to ensure reproducibility.
 \end{abstract}
 
 % --- Introduction ---
@@ -58,7 +58,7 @@ Let $\mathbf{x} \in \mathbb{R}_+^{H\times W}$ denote the clean, high-resolution 
 \begin{equation}
 \mathbf{y} \sim \mathrm{Poisson}(\mathcal{A}(\mathbf{x}) + B),
 \end{equation}
-where $\mathcal{A}$ is a linear convolution with a \emph{measured} PSF, and $B$ is a \emph{measured} background term (dark counts and out-of-focus/background fluorescence). We retain $\mathbf{y}$ as integer counts and de-normalize the model's prediction before applying the forward model.
+where $\mathcal{A}$ is a linear convolution with a \emph{measured} PSF, and $B$ is a \emph{measured} background term (dark counts and out-of-focus/background fluorescence). We retain $\mathbf{y}$ as integer counts and de-normalize the model's prediction before applying the forward model. When a measured PSF is unavailable, we use a Gaussian PSF \emph{only for ablations and diagnostics}.
 
 \subsection{Diffusion Preliminaries}
 Following DDPM, the model predicts noise $\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)$ and we form an estimate of the clean image
@@ -68,9 +68,9 @@ Following DDPM, the model predicts noise $\boldsymbol{\epsilon}_\theta(\mathbf{x
 This estimate is corrected using a physics-informed guidance step.
 
 \subsection{Training and Inference Paradigms}
-\textbf{Training.} We train an \emph{unconditional} diffusion prior over \twop images with a standard DDPM objective. To gently encourage physics-consistency without sacrificing prior generality across microscopes/PSFs, we optionally add a \emph{light} forward-consistency regularizer: simulate \wf by applying the measured forward model to $\hat{\mathbf{x}}_0$ and penalize discrepancy in the measurement domain. This term is small and warmed up during training.
+\textbf{Training.} We train an \emph{unconditional} diffusion prior (default) with a standard noise-prediction objective, and include a light self-supervised forward-consistency term: simulate \wf by applying the measured forward model to the predicted \twop and compare in the \wf domain (L$_2$/KL/PKL variants; small weight with warm-up). An explicit \wf conditioning channel is supported but disabled in our main configuration.
 
-\textbf{Inference.} At sampling time, \wf enters through physics-informed guidance using the same measured forward model. Our implementation supports multiple guidance types (L$_2$, Anscombe+L$_2$, PKL) under a common schedule and gradient normalization. All experiments use \emph{real microscopy} with measured PSFs and backgrounds.
+\textbf{Inference.} At sampling time, \wf enters through physics-informed guidance using the same measured forward model. Our implementation supports multiple guidance types (L$_2$, KL, Anscombe+L$_2$, PKL) under a common schedule and gradient normalization. All experiments use \emph{real microscopy} with measured PSFs and backgrounds.
 
 \subsection{Physics-Informed Guidance}
 \paragraph{L$_2$ Guidance (Baseline).}
@@ -85,11 +85,11 @@ Apply $f(z)=2\sqrt{z + 3/8}$ before L$_2$:
 \end{equation}
 
 \paragraph{Proposed PKL Guidance.}
-Using the KL divergence for Poisson,
+Using the KL divergence for Poisson (with optional read-noise term $\sigma^2$),
 \begin{equation}
-\nabla_{\text{PKL}} = \mathcal{A}^T\left(1 - \frac{\mathbf{y}}{\mathcal{A}(\hat{\mathbf{x}}_0)+B+\epsilon}\right),
+\nabla_{\text{PKL}} = \mathcal{A}^T\left(1 - \frac{\mathbf{y}}{\mathcal{A}(\hat{\mathbf{x}}_0)+B+\sigma^2+\epsilon}\right),
 \end{equation}
-with small $\epsilon$ for numerical stability.
+with small $\epsilon$ for numerical stability and $\sigma^2$ set from measured read noise when available.
 
 \subsection{Adaptive Guidance Schedule}
 We compute a corrected estimate
@@ -105,14 +105,14 @@ This schedule normalizes step size and ramps guidance after a threshold $T_{\tex
 \subsection{Implementation Details and Design Choices}
 To ensure clarity and reproducibility, we enumerate the key design decisions that affect stability and performance:
 \begin{itemize}
-    \item \textbf{Data normalization:} Training images are normalized to $[-1,1]$; at inference, $\hat{\mathbf{x}}_0$ is de-normalized to non-negative intensities before applying $\mathcal{A}$. We clip to $\ge 0$ post-correction.
-    \item \textbf{Background handling:} $B$ is measured per dataset/session; we ablate global scalar vs. per-image estimates. We avoid subtracting $B$ from raw counts to preserve Poisson structure.
+    \item \textbf{Data normalization:} Training images are normalized to $[-1,1]$; guidance operates in the intensity domain via an invertible transform. We clamp intensities to $\ge 0$ for physics operations.
+    \item \textbf{Background handling and read noise:} $B$ is measured per dataset/session; we ablate global scalar vs. per-image estimates. We avoid subtracting $B$ from raw counts to preserve Poisson structure. When measured, read noise is incorporated as $\sigma^2$ in PKL.
     \item \textbf{Stability constants:} $\epsilon$ (Poisson ratio) and $\epsilon_\lambda$ (scheduler) are tuned on validation; we report ranges and sensitivity.
     \item \textbf{Gradient normalization:} We use global L2 normalization as above; we ablate per-pixel vs. global scaling and alternative norms.
     \item \textbf{Guidance ramp:} $T_{\text{thr}}$ controls warm-up; we ablate linear vs. cosine ramps and thresholds.
-    \item \textbf{Forward model fidelity:} Measured PSFs are used by default; we ablate against Gaussian PSFs and broadened/mismatched PSFs to assess robustness.
+    \item \textbf{Forward model fidelity:} Measured PSFs are used by default; we ablate against Gaussian PSFs and broadened/mismatched PSFs to assess robustness. We resample PSFs to match image pixel size when needed.
     \item \textbf{Alignment:} We quantify tolerance to small misregistrations by evaluating on imperfectly registered pairs.
-    \item \textbf{Diffusion options:} Learned variance and EMA are toggled per configuration; we report their effect. Mixed precision and memory optimizations (channels-last, gradient checkpointing) are used as engineering choices and ablated when relevant.
+    \item \textbf{Diffusion options:} Learned variance and EMA are toggled per configuration; we report their effect. Mixed precision and memory optimizations (channels-last, gradient checkpointing) are used as engineering choices and ablated when relevant. For inference we employ a fast DPMSolver++ scheduler and apply guidance in the $\hat{\mathbf{x}}_0$ domain each step.
 \end{itemize}
 These points address prior “method detail gaps” by specifying normalization, numerical safeguards, and forward-model usage.
 
@@ -139,6 +139,7 @@ We compare to:
     \item \textbf{WF Input (passthrough).}
     \item \textbf{Richardson--Lucy deconvolution (RL)} with measured PSF.
     \item \textbf{L$_2$-guided Diffusion.}
+    \item \textbf{KL-guided Diffusion.}
     \item \textbf{Anscombe+L$_2$-guided Diffusion.}
     \item \textbf{PKL-guided Diffusion (ours).}
 \end{itemize}

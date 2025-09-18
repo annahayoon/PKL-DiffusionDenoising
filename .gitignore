@@ -14,9 +14,11 @@ tmp/
 temp/
 *.log
 
-# Root level shell scripts and markdown files
+# Root level shell scripts
 /*.sh
-/*.md
+# Track Markdown and docs directory
+!/docs/
+!/*.md
 
 # Exclude baselines/sinsr directory
 baselines/sinsr/

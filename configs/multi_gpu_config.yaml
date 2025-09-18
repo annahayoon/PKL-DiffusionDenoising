@@ -60,6 +60,8 @@ model:
       enabled: true                 # Use ProgressiveTrainer class
       max_resolution: 128           # Maximum resolution
       curriculum_type: "exponential" # linear, exponential, adaptive
+      # Explicit resolution schedule passed to trainer
+      resolution_schedule: [32, 64, 96, 128]
       steps_per_resolution: [200000, 250000, 300000, 250000]  # Progressive steps: 32→64→96→128 (1M total)
       
       # Smooth transitions
@@ -143,6 +145,14 @@ training:
   perceptual_loss_weight: 0.0   # DISABLED - Pure self-supervised
   cycle_loss_type: smooth_l1
   use_perceptual_loss: false    # DISABLED - Pure self-supervised
+
+  # Light physics forward-consistency (keeps unconditional prior; improves generalization)
+  use_forward_consistency: true         # Enable small forward-consistency loss
+  forward_consistency_weight: 0.01      # Small lambda for stability
+  forward_consistency_type: l2          # l2 | kl | pkl
+  forward_consistency_sigma2: 1.0       # For kl type
+  forward_consistency_epsilon: 1e-6     # For pkl type numerical stability
+  forward_consistency_warmup_steps: 2000
   
   # STEP-BASED validation and checkpointing
   val_check_interval: 500       # Validate every 500 steps (must be ≤ batches per epoch)
@@ -171,12 +181,12 @@ data:
   use_16bit_normalization: true     # Proper 16-bit normalization
   align_pairs: true                 # Align WF to 2P images
   use_self_supervised: true         # Use self-supervised learning with forward model
-  use_zarr: false
+  
   
   # Multi-resolution Data Pipeline
   data_loading:
     # Standard data loading
-    use_zarr: false               # Use standard image loading
+    
     cache_dataset: true           # Enable dataset caching for efficiency
     
     # Multi-resolution data pipeline

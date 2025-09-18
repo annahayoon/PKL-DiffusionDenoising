@@ -385,6 +385,89 @@ def psf_params_from_tensor(psf: torch.Tensor) -> Tuple[float, float]:
     return float(sx), float(sy)
 
 
+def psf_from_config(physics_config: dict | object) -> Tuple[PSF, Optional[float]]:
+    """Create a PSF from a config-like object and return (PSF, target_pixel_size_xy_nm).
+
+    The function handles these cases:
+    - physics.use_psf and physics.use_bead_psf: build PSF from bead images via build_psf_bank
+    - physics.use_psf with physics.psf_path: load PSF from file
+    - otherwise: optional Gaussian fallback using cfg.psf fields or default PSF
+
+    The returned PSF may carry pixel size metadata if available. The second return
+    value is the configured target pixel size in nm if present, otherwise None.
+    """
+    # Access helpers for nested attributes/dicts
+    def _get(obj, key, default=None):
+        try:
+            # OmegaConf-style or dict
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+        except Exception:
+            return default
+
+    use_psf = bool(_get(physics_config, "use_psf", False))
+    use_bead_psf = bool(_get(physics_config, "use_bead_psf", False))
+
+    # Default result
+    psf_obj: Optional[PSF] = None
+
+    if use_psf and use_bead_psf:
+        beads_dir = _get(physics_config, "beads_dir", "data/beads")
+        try:
+            bank = build_psf_bank(beads_dir)
+            bead_mode = _get(physics_config, "bead_mode", None)
+            if bead_mode and bead_mode in bank:
+                psf_tensor = bank[bead_mode]
+            elif "with_AO" in bank:
+                psf_tensor = bank["with_AO"]
+            elif "no_AO" in bank:
+                psf_tensor = bank["no_AO"]
+            else:
+                psf_tensor = next(iter(bank.values()))
+
+            psf_array = psf_tensor.detach().cpu().numpy().astype(np.float32)
+            pixel_size_xy_nm = getattr(psf_tensor, "pixel_size_xy_nm", None)
+            psf_obj = PSF(psf_array=psf_array, pixel_size_xy_nm=pixel_size_xy_nm)
+        except Exception:
+            psf_obj = None
+
+    if psf_obj is None and use_psf:
+        psf_path = _get(physics_config, "psf_path", None)
+        if psf_path:
+            psf_obj = PSF(psf_path=psf_path)
+        else:
+            psf_obj = PSF()
+
+    if psf_obj is None:
+        psf_cfg = _get(physics_config, "psf", {})
+        try:
+            # Expect a dict-like with type/size/sigma_x/sigma_y
+            psf_type = _get(psf_cfg, "type", "gaussian")
+            if psf_type == "gaussian":
+                size = int(_get(psf_cfg, "size", 21))
+                sigma_x = float(_get(psf_cfg, "sigma_x", 2.0))
+                sigma_y = float(_get(psf_cfg, "sigma_y", 2.0))
+                x = np.arange(size) - size // 2
+                y = np.arange(size) - size // 2
+                xx, yy = np.meshgrid(x, y)
+                psf_array = np.exp(-(xx ** 2 / (2 * sigma_x ** 2) + yy ** 2 / (2 * sigma_y ** 2)))
+                psf_obj = PSF(psf_array=psf_array.astype(np.float32))
+            else:
+                psf_obj = PSF()
+        except Exception:
+            psf_obj = PSF()
+
+    target_pixel_size_xy_nm = _get(physics_config, "target_pixel_size_xy_nm", None)
+    if target_pixel_size_xy_nm is not None:
+        try:
+            target_pixel_size_xy_nm = float(target_pixel_size_xy_nm)
+        except Exception:
+            target_pixel_size_xy_nm = None
+
+    return psf_obj, target_pixel_size_xy_nm
+
+
 class ForwardModel:
     """WF to 2P forward model with PSF convolution and noise."""
 

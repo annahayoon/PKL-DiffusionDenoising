@@ -146,8 +146,16 @@ class ProgressiveTrainer(DDPMTrainer):
     
     def _setup_progressive_training(self):
         """Setup progressive training parameters."""
-        # Resolution schedule
-        self.resolution_schedule = self.model.resolutions
+        # Resolution schedule: allow override from config.progressive.resolution_schedule
+        cfg_schedule = self.progressive_config.get("resolution_schedule", None)
+        if isinstance(cfg_schedule, (list, tuple)) and len(cfg_schedule) > 0:
+            # Validate and coerce to ints
+            try:
+                self.resolution_schedule = [int(r) for r in cfg_schedule]
+            except Exception:
+                self.resolution_schedule = self.model.resolutions
+        else:
+            self.resolution_schedule = self.model.resolutions
         self.current_phase = 0
         
         # Training epochs per resolution with curriculum

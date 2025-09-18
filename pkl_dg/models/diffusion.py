@@ -117,6 +117,14 @@ class DDPMTrainer(LightningModuleBase):
         if self.use_ema:
             self.ema_model = self._create_ema_model()
             
+        # Memory format optimization
+        self.channels_last = bool(self.config.get("channels_last", False))
+        if self.channels_last:
+            try:
+                self.model = self.model.to(memory_format=torch.channels_last)
+            except Exception:
+                pass
+
         # Mixed precision training setup
         self.mixed_precision = config.get("mixed_precision", False)
         self.autocast_dtype = self._get_optimal_dtype()
@@ -589,7 +597,7 @@ class DDPMTrainer(LightningModuleBase):
             vlb = vlb.mean(dim=-1)
         return vlb.mean()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def p_sample(self, pred_noise: torch.Tensor, x: torch.Tensor, t: torch.Tensor, clip_denoised: bool = True) -> torch.Tensor:
         model_mean, _, model_log_variance = self.p_mean_variance(
             pred_noise, x=x, t=t, clip_denoised=clip_denoised
@@ -599,7 +607,7 @@ class DDPMTrainer(LightningModuleBase):
         return model_mean + nonzero_mask * torch.exp(0.5 * model_log_variance) * noise
 
     # ===== Guided DDPM sampling per ICLR_2025.tex (PKL, L2, Anscombe) =====
-    @torch.no_grad()
+    @torch.inference_mode()
     def ddpm_guided_sample(
         self,
         y: torch.Tensor,
@@ -668,7 +676,7 @@ class DDPMTrainer(LightningModuleBase):
 
         return x_t
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def ddpm_sample(self, num_images: int, image_shape: tuple, use_ema: bool = True) -> torch.Tensor:
         """Generate samples by full DDPM ancestral sampling (slow).
 
@@ -696,6 +704,14 @@ class DDPMTrainer(LightningModuleBase):
     def training_step(self, batch, batch_idx):
         # Expect (target_2p, conditioner_wf)
         x_0, c_wf = batch
+        # Apply channels-last memory format if requested
+        if self.channels_last:
+            try:
+                x_0 = x_0.contiguous(memory_format=torch.channels_last)
+                if isinstance(c_wf, torch.Tensor):
+                    c_wf = c_wf.contiguous(memory_format=torch.channels_last)
+            except Exception:
+                pass
         b = x_0.shape[0]
         device = x_0.device
         # Timestep curriculum: reduce max_t early to stabilize training
@@ -711,15 +727,24 @@ class DDPMTrainer(LightningModuleBase):
             t = torch.randint(0, self.num_timesteps, (b,), device=device)
         noise = torch.randn_like(x_0)
         x_t = self.q_sample(x_0, t, noise)
+        if self.channels_last:
+            try:
+                x_t = x_t.contiguous(memory_format=torch.channels_last)
+            except Exception:
+                pass
         
         # Use mixed precision if enabled
         use_conditioning = bool(self.config.get("use_conditioning", True))
+        # Classifier-free dropout (whole-batch) for conditional path
+        cfg_dropout_prob = float(self.config.get("cfg_dropout_prob", 0.0))
+        drop_cond = use_conditioning and (cfg_dropout_prob > 0.0) and (torch.rand(()) < cfg_dropout_prob)
+        c_used = None if drop_cond else c_wf
         
         if self.mixed_precision and torch.cuda.is_available():
             with autocast(dtype=self.autocast_dtype):
                 if use_conditioning:
                     try:
-                        noise_pred = self.model(x_t, t, cond=c_wf)
+                        noise_pred = self.model(x_t, t, cond=c_used)
                     except TypeError:
                         noise_pred = self.model(x_t, t)
                 else:
@@ -751,6 +776,42 @@ class DDPMTrainer(LightningModuleBase):
                     base_loss = diffusion_loss + self.elbo_weight * vlb_term
                 else:
                     base_loss = diffusion_loss
+
+                # Optional: physics forward-consistency loss (light weight)
+                use_fc = bool(self.config.get("use_forward_consistency", self.config.get("use_forward_consistency_loss", False)))
+                if use_fc and (self.forward_model is not None) and (c_wf is not None):
+                    try:
+                        # Map predicted x0 and conditioner to intensity domain
+                        x0_hat_int = torch.clamp(self._model_to_intensity(x0_hat, self.transform), min=0)
+                        wf_int = torch.clamp(self._model_to_intensity(c_wf, self.transform), min=0)
+                        # Project predicted x0 via forward model
+                        y_hat = self.forward_model.apply_psf(x0_hat_int) + getattr(self.forward_model, 'background', 0.0)
+                        # Select loss type
+                        fc_type = str(self.config.get("forward_consistency_type", self.config.get("consistency_type", "l2"))).lower()
+                        if fc_type == "pkl":
+                            sigma2 = float(getattr(self.forward_model, 'read_noise_sigma', 0.0)) ** 2
+                            denom = y_hat + sigma2 + float(self.config.get("forward_consistency_epsilon", self.config.get("consistency_epsilon", 1e-6)))
+                            residual = 1.0 - (wf_int / denom)
+                            forward_consistency = (residual ** 2).mean()
+                        elif fc_type == "kl":
+                            # Gaussian KL proxy: scaled L2
+                            sigma2 = float(self.config.get("forward_consistency_sigma2", self.config.get("consistency_sigma2", 1.0)))
+                            forward_consistency = F.mse_loss(y_hat, wf_int) / max(2.0 * sigma2, 1e-6)
+                        else:  # l2
+                            forward_consistency = F.mse_loss(y_hat, wf_int)
+                        lambda_fc = float(self.config.get("forward_consistency_weight", self.config.get("consistency_weight", 0.01)))
+                        # Optional warmup on lambda
+                        warmup = int(self.config.get("forward_consistency_warmup_steps", self.config.get("consistency_warmup_steps", 2000)))
+                        if hasattr(self, 'global_step') and warmup > 0:
+                            ramp = min(1.0, max(0.0, float(self.global_step) / float(warmup)))
+                        else:
+                            ramp = 1.0
+                        base_loss = base_loss + (lambda_fc * ramp) * forward_consistency
+                        self._log_if_trainer("train/forward_consistency", forward_consistency)
+                        self._log_if_trainer("train/forward_consistency_lambda", lambda_fc * ramp)
+                    except Exception:
+                        # Be conservative: do not fail training due to consistency term
+                        pass
 
                 # Apply dual objective loss if enabled
                 if self.use_dual_objective_loss:
@@ -811,6 +872,36 @@ class DDPMTrainer(LightningModuleBase):
             else:
                 base_loss = diffusion_loss
 
+            # Optional: physics forward-consistency loss (light weight)
+            use_fc = bool(self.config.get("use_forward_consistency", self.config.get("use_forward_consistency_loss", False)))
+            if use_fc and (self.forward_model is not None) and (c_wf is not None):
+                try:
+                    x0_hat_int = torch.clamp(self._model_to_intensity(x0_hat, self.transform), min=0)
+                    wf_int = torch.clamp(self._model_to_intensity(c_wf, self.transform), min=0)
+                    y_hat = self.forward_model.apply_psf(x0_hat_int) + getattr(self.forward_model, 'background', 0.0)
+                    fc_type = str(self.config.get("forward_consistency_type", self.config.get("consistency_type", "l2"))).lower()
+                    if fc_type == "pkl":
+                        sigma2 = float(getattr(self.forward_model, 'read_noise_sigma', 0.0)) ** 2
+                        denom = y_hat + sigma2 + float(self.config.get("forward_consistency_epsilon", self.config.get("consistency_epsilon", 1e-6)))
+                        residual = 1.0 - (wf_int / denom)
+                        forward_consistency = (residual ** 2).mean()
+                    elif fc_type == "kl":
+                        sigma2 = float(self.config.get("forward_consistency_sigma2", self.config.get("consistency_sigma2", 1.0)))
+                        forward_consistency = F.mse_loss(y_hat, wf_int) / max(2.0 * sigma2, 1e-6)
+                    else:
+                        forward_consistency = F.mse_loss(y_hat, wf_int)
+                    lambda_fc = float(self.config.get("forward_consistency_weight", self.config.get("consistency_weight", 0.01)))
+                    warmup = int(self.config.get("forward_consistency_warmup_steps", self.config.get("consistency_warmup_steps", 2000)))
+                    if hasattr(self, 'global_step') and warmup > 0:
+                        ramp = min(1.0, max(0.0, float(self.global_step) / float(warmup)))
+                    else:
+                        ramp = 1.0
+                    base_loss = base_loss + (lambda_fc * ramp) * forward_consistency
+                    self._log_if_trainer("train/forward_consistency", forward_consistency)
+                    self._log_if_trainer("train/forward_consistency_lambda", lambda_fc * ramp)
+                except Exception:
+                    pass
+
             # Apply dual objective loss if enabled
             if self.use_dual_objective_loss:
                 loss_components = self.dual_objective_loss(
@@ -867,7 +958,7 @@ class DDPMTrainer(LightningModuleBase):
         return loss
 
     def _update_ema(self, decay: float = 0.999):
-        with torch.no_grad():
+        with torch.inference_mode():
             for ema_param, param in zip(
                 self.ema_model.parameters(), self.model.parameters()
             ):
@@ -1008,12 +1099,31 @@ class DDPMTrainer(LightningModuleBase):
         return avg_loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.config.get("learning_rate", 1e-4),
-            betas=(0.9, 0.999),
-            weight_decay=self.config.get("weight_decay", 1e-6),
-        )
+        # Support fused AdamW when available and enabled in config
+        use_fused = bool(self.config.get("use_fused_adam", False)) and torch.cuda.is_available()
+        try:
+            if use_fused:
+                optimizer = torch.optim.AdamW(
+                    self.model.parameters(),
+                    lr=self.config.get("learning_rate", 1e-4),
+                    betas=(0.9, 0.999),
+                    weight_decay=self.config.get("weight_decay", 1e-6),
+                    fused=True,
+                )
+            else:
+                optimizer = torch.optim.AdamW(
+                    self.model.parameters(),
+                    lr=self.config.get("learning_rate", 1e-4),
+                    betas=(0.9, 0.999),
+                    weight_decay=self.config.get("weight_decay", 1e-6),
+                )
+        except TypeError:
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.config.get("learning_rate", 1e-4),
+                betas=(0.9, 0.999),
+                weight_decay=self.config.get("weight_decay", 1e-6),
+            )
 
         sched_configs = self.config.get("advanced_schedulers", {})
         use_advanced = bool(sched_configs.get("enabled", False))

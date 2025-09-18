@@ -4,11 +4,10 @@ Unified Baseline Methods for PKL-DG Evaluation
 
 This module provides a comprehensive baseline evaluation framework that includes:
 1. Richardson-Lucy Deconvolution 
-2. RCAN (Residual Channel Attention Network)
-3. Unified interface for running and comparing baseline methods
-4. PSF extraction from bead data
-5. Evaluation against ground truth
-6. Visualization and results export
+2. Unified interface for running and comparing baseline methods
+3. PSF extraction from bead data
+4. Evaluation against ground truth
+5. Visualization and results export
 
 Usage:
     # Richardson-Lucy baseline
@@ -18,23 +17,6 @@ Usage:
         --input-dir data/real_microscopy/splits/test/wf \
         --gt-dir data/real_microscopy/splits/test/2p \
         --output-dir outputs/rl_baseline
-
-    # RCAN baseline
-    python -m pkl_dg.baselines.baseline \
-        --method rcan \
-        --checkpoint-path models/rcan_checkpoint.pth \
-        --input-dir data/real_microscopy/splits/test/wf \
-        --gt-dir data/real_microscopy/splits/test/2p \
-        --output-dir outputs/rcan_baseline
-
-    # Compare multiple methods
-    python -m pkl_dg.baselines.baseline \
-        --method all \
-        --bead-dir data/real_microscopy/beads \
-        --checkpoint-path models/rcan_checkpoint.pth \
-        --input-dir data/real_microscopy/splits/test/wf \
-        --gt-dir data/real_microscopy/splits/test/2p \
-        --output-dir outputs/baseline_comparison
 """
 
 import argparse
@@ -103,76 +85,7 @@ def richardson_lucy_restore(
         return estimate
 
 
-# =============================================================================
-# RCAN Wrapper Implementation
-# =============================================================================
 
-class RCANWrapper:
-    """Thin wrapper to run RCAN if available.
-
-    Attempts to import `rcan` or `basicsr` style implementations. This is a best-effort
-    convenience for evaluation; if dependencies are missing, it raises ImportError with
-    a clear message.
-    """
-
-    def __init__(self, checkpoint_path: Optional[str] = None, device: str = "cpu"):
-        self.device = device
-        self.model = None
-        self._load_model(checkpoint_path)
-
-    def _load_model(self, checkpoint_path: Optional[str]):
-        try:
-            import torch
-            # Try a common RCAN implementation
-            try:
-                from rcan.model import RCAN as RCANNet  # type: ignore
-            except Exception:
-                # Fallback to a BasicSR-like RCAN if available
-                from basicsr.archs.rcan_arch import RCAN as RCANNet  # type: ignore
-
-            # Minimal RCAN config; real configs should mirror training
-            model = RCANNet()
-            if checkpoint_path is not None:
-                state = torch.load(checkpoint_path, map_location=self.device)
-                state_dict = state.get("state_dict", state)
-                model.load_state_dict(state_dict, strict=False)
-            model.eval()
-            model.to(self.device)
-            self.model = model
-        except Exception as e:
-            raise ImportError(
-                "RCAN dependencies not available. Install an RCAN implementation (e.g., rcan or basicsr) and provide a compatible checkpoint."
-            ) from e
-
-    @staticmethod
-    def _to_tensor(img: np.ndarray, device: str):
-        import torch
-
-        ten = torch.from_numpy(img.astype(np.float32))
-        if ten.ndim == 2:
-            ten = ten.unsqueeze(0).unsqueeze(0)
-        elif ten.ndim == 3 and ten.shape[2] == 1:
-            ten = ten.transpose(2, 0, 1).unsqueeze(0)
-        else:
-            raise ValueError("RCANWrapper expects single-channel inputs")
-        return ten.to(device)
-
-    @staticmethod
-    def _to_numpy(ten) -> np.ndarray:
-        import torch
-
-        out = ten.detach().float().cpu().squeeze().numpy()
-        return out.astype(np.float32)
-
-    def infer(self, image: np.ndarray) -> np.ndarray:
-        if self.model is None:
-            raise RuntimeError("RCAN model not loaded")
-        import torch
-
-        x = self._to_tensor(image, self.device)
-        with torch.no_grad():
-            y = self.model(x)
-        return self._to_numpy(y)
 
 
 # =============================================================================
@@ -415,143 +328,6 @@ class RichardsonLucyBaseline(BaselineMethod):
         return reconstructed
 
 
-class RCANBaseline(BaselineMethod):
-    """RCAN (Residual Channel Attention Network) baseline."""
-    
-    def __init__(
-        self,
-        checkpoint_path: Optional[str] = None,
-        device: str = "cuda",
-        patch_size: int = 256,
-        stride: int = 128,
-    ):
-        """
-        Initialize RCAN baseline.
-        
-        Args:
-            checkpoint_path: Path to RCAN checkpoint
-            device: Computation device
-            patch_size: Size of patches for processing
-            stride: Stride between patches
-        """
-        super().__init__(device)
-        self.patch_size = patch_size
-        self.stride = stride
-        
-        # Initialize RCAN wrapper
-        self.rcan = RCANWrapper(checkpoint_path=checkpoint_path, device=device)
-        print(f"RCAN model loaded on {device}")
-    
-    def get_method_name(self) -> str:
-        return "rcan"
-    
-    def _extract_patches(self, image: np.ndarray) -> Dict[int, np.ndarray]:
-        """Extract overlapping patches from image."""
-        patches = {}
-        patch_id = 0
-        
-        h, w = image.shape
-        patches_y = (h - self.patch_size) // self.stride + 1
-        patches_x = (w - self.patch_size) // self.stride + 1
-        
-        print(f"Extracting patches: {patches_y} rows × {patches_x} cols = {patches_y * patches_x} patches")
-        
-        for row in range(patches_y):
-            for col in range(patches_x):
-                y_start = row * self.stride
-                x_start = col * self.stride
-                y_end = y_start + self.patch_size
-                x_end = x_start + self.patch_size
-                
-                patch = image[y_start:y_end, x_start:x_end]
-                patches[patch_id] = patch
-                patch_id += 1
-        
-        return patches
-    
-    def _reconstruct_from_patches(
-        self, 
-        patches: Dict[int, np.ndarray], 
-        original_shape: Tuple[int, int]
-    ) -> np.ndarray:
-        """Reconstruct full FOV image from patches with seamless blending."""
-        h, w = original_shape
-        patches_y = (h - self.patch_size) // self.stride + 1
-        patches_x = (w - self.patch_size) // self.stride + 1
-        
-        # Initialize canvas
-        canvas = np.zeros((h, w), dtype=np.float32)
-        weight_map = np.zeros((h, w), dtype=np.float32)
-        
-        # Process all patches
-        for patch_id, patch_data in patches.items():
-            row = patch_id // patches_x
-            col = patch_id % patches_x
-            
-            # Calculate position in the original image
-            y_start = row * self.stride
-            x_start = col * self.stride
-            y_end = y_start + self.patch_size
-            x_end = x_start + self.patch_size
-            
-            # Create feathering weights for seamless blending
-            patch_weight = np.ones((self.patch_size, self.patch_size), dtype=np.float32)
-            
-            # Feather the edges to create smooth blending
-            feather_size = self.stride // 2
-            
-            # Top edge feathering
-            if row > 0:
-                patch_weight[:feather_size, :] *= np.linspace(0, 1, feather_size)[:, np.newaxis]
-            
-            # Bottom edge feathering
-            if row < patches_y - 1:
-                patch_weight[-feather_size:, :] *= np.linspace(1, 0, feather_size)[:, np.newaxis]
-            
-            # Left edge feathering
-            if col > 0:
-                patch_weight[:, :feather_size] *= np.linspace(0, 1, feather_size)[np.newaxis, :]
-            
-            # Right edge feathering
-            if col < patches_x - 1:
-                patch_weight[:, -feather_size:] *= np.linspace(1, 0, feather_size)[np.newaxis, :]
-            
-            # Add patch to canvas
-            canvas[y_start:y_end, x_start:x_end] += patch_data * patch_weight
-            weight_map[y_start:y_end, x_start:x_end] += patch_weight
-        
-        # Normalize by weights
-        mask = weight_map > 0
-        canvas[mask] = canvas[mask] / weight_map[mask]
-        
-        # Apply slight smoothing to reduce any remaining artifacts
-        canvas = gaussian_filter(canvas, sigma=0.5)
-        
-        return canvas
-    
-    def process_image(self, wf_image: np.ndarray) -> np.ndarray:
-        """Process full FOV image using RCAN."""
-        print(f"Processing image with RCAN")
-        
-        # For small images, process directly
-        if wf_image.shape[0] <= self.patch_size and wf_image.shape[1] <= self.patch_size:
-            return self.rcan.infer(wf_image)
-        
-        # Extract patches for large images
-        patches = self._extract_patches(wf_image)
-        
-        # Process each patch
-        processed_patches = {}
-        
-        for patch_id, patch in tqdm(patches.items(), desc="RCAN patches"):
-            processed_patches[patch_id] = self.rcan.infer(patch)
-        
-        # Reconstruct full FOV
-        reconstructed = self._reconstruct_from_patches(processed_patches, wf_image.shape)
-        
-        return reconstructed
-
-
 # =============================================================================
 # Comprehensive Baseline Evaluator
 # =============================================================================
@@ -785,8 +561,8 @@ def main():
     
     # Method selection
     parser.add_argument("--method", 
-                       choices=["richardson_lucy", "rcan", "all"],
-                       default="all",
+                       choices=["richardson_lucy"],
+                       default="richardson_lucy",
                        help="Baseline method to run")
     
     # Required arguments
@@ -806,9 +582,7 @@ def main():
                          help="PSF extraction method")
     rl_group.add_argument("--save-psf", help="Save extracted PSF to this path")
     
-    # RCAN specific options
-    rcan_group = parser.add_argument_group("RCAN options")
-    rcan_group.add_argument("--checkpoint-path", help="Path to RCAN checkpoint")
+    #
     
     # Processing options
     parser.add_argument("--device", default="cuda", help="Computation device")
@@ -827,7 +601,7 @@ def main():
     # Initialize baseline methods
     methods = []
     
-    if args.method in ["richardson_lucy", "all"]:
+    if args.method in ["richardson_lucy"]:
         if not args.psf_path and not args.bead_dir:
             print("Error: Richardson-Lucy requires either --psf-path or --bead-dir")
             return 1
@@ -852,20 +626,7 @@ def main():
             psf_path = output_dir / "extracted_psf.tif"
             rl_method.save_psf(str(psf_path))
     
-    if args.method in ["rcan", "all"]:
-        if not args.checkpoint_path:
-            print("Warning: RCAN requires --checkpoint-path, skipping RCAN")
-        else:
-            try:
-                rcan_method = RCANBaseline(
-                    checkpoint_path=args.checkpoint_path,
-                    device=args.device,
-                    patch_size=args.patch_size,
-                    stride=args.stride,
-                )
-                methods.append(rcan_method)
-            except ImportError as e:
-                print(f"Warning: Could not initialize RCAN: {e}")
+    #
     
     if not methods:
         print("Error: No baseline methods could be initialized")

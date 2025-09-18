@@ -123,6 +123,36 @@ class L2Guidance(GuidanceStrategy):
         return gradient
 
 
+class KLGuidance(GuidanceStrategy):
+    """Plain KL guidance for Gaussian observation model.
+    
+    Uses KL divergence between Gaussian observations assuming fixed variance.
+    This reduces to scaled residual A^T(Ax + B - y) up to a constant factor.
+    """
+    
+    def __init__(self, sigma2: float = 1.0):
+        # Variance term for Gaussian observation; used as a scale factor
+        self.sigma2 = float(sigma2) if sigma2 is not None else 1.0
+        if self.sigma2 <= 0:
+            self.sigma2 = 1.0
+    
+    def compute_gradient(
+        self,
+        x0_hat: torch.Tensor,
+        y: torch.Tensor,
+        forward_model: "ForwardModel",
+        t: int,
+    ) -> torch.Tensor:
+        Ax = forward_model.apply_psf(x0_hat)
+        Ax_plus_B = Ax + forward_model.background
+        # Gaussian KL gradient ∝ A^T(Ax + B - y); include 1/sigma^2 if provided
+        residual = Ax_plus_B - y
+        gradient = forward_model.apply_psf_adjoint(residual)
+        if self.sigma2 != 1.0:
+            gradient = gradient / self.sigma2
+        return gradient
+
+
 class AnscombeGuidance(GuidanceStrategy):
     """Anscombe transform-based guidance strategy.
     
@@ -202,6 +232,11 @@ def create_l2_guidance() -> L2Guidance:
     return L2Guidance()
 
 
+def create_kl_guidance(sigma2: float = 1.0) -> KLGuidance:
+    """Create KL guidance strategy (Gaussian)."""
+    return KLGuidance(sigma2=sigma2)
+
+
 def create_anscombe_guidance(epsilon: float = 1e-6) -> AnscombeGuidance:
     """Create Anscombe guidance strategy."""
     return AnscombeGuidance(epsilon=epsilon)
@@ -226,10 +261,12 @@ __all__ = [
     "GuidanceStrategy",
     "PKLGuidance",
     "L2Guidance",
+    "KLGuidance",
     "AnscombeGuidance",
     "AdaptiveSchedule",
     "create_pkl_guidance",
     "create_l2_guidance",
+    "create_kl_guidance",
     "create_anscombe_guidance",
     "create_adaptive_schedule",
 ]

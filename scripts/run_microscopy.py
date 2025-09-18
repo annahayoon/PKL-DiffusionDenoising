@@ -6,7 +6,7 @@ This script combines both training and evaluation workflows in a single interfac
 similar to other diffusion repositories. It supports:
 - Training diffusion models on microscopy data
 - Evaluating trained models with comprehensive metrics
-- Baseline comparisons (Richardson-Lucy, RCAN)
+- Baseline comparison (Richardson-Lucy)
 - Both paired and unpaired (self-supervised) training modes
 
 Usage:
@@ -42,6 +42,9 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Tuple
 import warnings
+import itertools
+from datetime import datetime
+import csv
 
 import hydra
 from hydra import compose, initialize
@@ -53,6 +56,7 @@ import numpy as np
 import random
 import wandb
 from torch.cuda.amp import GradScaler, autocast
+from contextlib import nullcontext
 from tqdm import tqdm
 from PIL import Image
 import tifffile
@@ -82,27 +86,23 @@ from pkl_dg.models.unet import UNet
 from pkl_dg.models.diffusion import DDPMTrainer, UnpairedDataset
 from pkl_dg.models.sampler import DDIMSampler
 from pkl_dg.data import RealPairsDataset, IntensityToModel, Microscopy16BitToModel
-
-# Optional Zarr import
-try:
-    from pkl_dg.data import ZarrPatchesDataset
-    HAS_ZARR = True
-except ImportError:
-    ZarrPatchesDataset = None
-    HAS_ZARR = False
 from pkl_dg.data.adaptive_dataset import create_adaptive_datasets, AdaptiveRealPairsDataset
-from pkl_dg.physics import PSF, build_psf_bank, ForwardModel
+from pkl_dg.physics import PSF, ForwardModel, psf_from_config
 # Guidance is a single module, not a package
 try:
-    from pkl_dg.guidance import PKLGuidance, L2Guidance, AnscombeGuidance
+    from pkl_dg.guidance import PKLGuidance, KLGuidance, L2Guidance, AnscombeGuidance, AdaptiveSchedule
     HAS_GUIDANCE = True
 except ImportError:
-    PKLGuidance = L2Guidance = AnscombeGuidance = None
+    PKLGuidance = KLGuidance = L2Guidance = AnscombeGuidance = AdaptiveSchedule = None
     HAS_GUIDANCE = False
 from pkl_dg.evaluation import Metrics
-# from pkl_dg.evaluation.robustness import RobustnessTests
-# from pkl_dg.evaluation.hallucination import HallucinationTests
-# from pkl_dg.evaluation.tasks import DownstreamTasks
+try:
+    from pkl_dg.evaluation import EvaluationSuite
+    HAS_EVAL_SUITE = True
+except Exception:
+    EvaluationSuite = None
+    HAS_EVAL_SUITE = False
+# (Optional evaluation extras available in docs)
 # Baselines import
 try:
     from pkl_dg.baseline import richardson_lucy_restore
@@ -122,12 +122,7 @@ from pkl_dg.utils import (
     setup_logging
 )
 
-# Optional imports
-try:
-    from pkl_dg.baseline import RCANWrapper
-    HAS_RCAN = True
-except ImportError:
-    HAS_RCAN = False
+#
 
 
 def setup_experiment(args, cfg: Optional[DictConfig] = None) -> DictConfig:
@@ -282,8 +277,14 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     log_file = logs_dir / f"training_{config_name}_{cfg.experiment.name}_{timestamp}_seed{seed}.log"
     
     import logging
+    # Honor configured logging level if provided
+    log_level_str = str(getattr(getattr(cfg, 'logging', {}), 'log_level', 'INFO')).upper()
+    try:
+        resolved_log_level = getattr(logging, log_level_str)
+    except Exception:
+        resolved_log_level = logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=resolved_log_level,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(log_file),
@@ -330,125 +331,18 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         print(f"✅ Using intensity normalization for {noise_model} noise")
 
     # Create forward model for cycle consistency (self-supervised training)
-    # Check physics config first for PSF settings
     physics_config = getattr(cfg, "physics", {})
-    use_psf = getattr(physics_config, "use_psf", False)
-    use_bead_psf = getattr(physics_config, "use_bead_psf", False)
-    
-    if use_psf and use_bead_psf:
-        # Load PSF from bead data
-        beads_dir = getattr(physics_config, "beads_dir", "data/beads")
-        try:
-            psf_bank = build_psf_bank(beads_dir)
-            bead_mode = getattr(physics_config, "bead_mode", None)
-            
-            if bead_mode and bead_mode in psf_bank:
-                psf_tensor = psf_bank[bead_mode]
-                print(f"✅ Loaded PSF from bead data (mode: {bead_mode})")
-            elif "with_AO" in psf_bank:
-                psf_tensor = psf_bank["with_AO"]
-                print("✅ Loaded PSF from bead data (mode: with_AO)")
-            elif "no_AO" in psf_bank:
-                psf_tensor = psf_bank["no_AO"]
-                print("✅ Loaded PSF from bead data (mode: no_AO)")
-            else:
-                # Use first available PSF
-                psf_tensor = next(iter(psf_bank.values()))
-                print(f"✅ Loaded PSF from bead data (mode: {list(psf_bank.keys())[0]})")
-            
-            # Extract sigma values from PSF for logging
-            from pkl_dg.physics import psf_params_from_tensor
-            sigma_x, sigma_y = psf_params_from_tensor(psf_tensor)
-            
-            # Extract pixel size information from PSF tensor
-            psf_pixel_size_xy_nm = getattr(psf_tensor, 'pixel_size_xy_nm', None)
-            target_pixel_size_xy_nm = getattr(physics_config, "target_pixel_size_xy_nm", None)
-            
-            if psf_pixel_size_xy_nm is not None:
-                print(f"   PSF pixel size: {psf_pixel_size_xy_nm:.2f} nm")
-                print(f"   PSF parameters (in pixels): σx={sigma_x:.2f}, σy={sigma_y:.2f}")
-                
-                # Convert sigma to physical units (nm)
-                sigma_x_nm = sigma_x * psf_pixel_size_xy_nm
-                sigma_y_nm = sigma_y * psf_pixel_size_xy_nm
-                print(f"   PSF parameters (in nm): σx={sigma_x_nm:.1f} nm, σy={sigma_y_nm:.1f} nm")
-                
-                if target_pixel_size_xy_nm is not None:
-                    target_pixel_size_xy_nm = float(target_pixel_size_xy_nm)
-                    print(f"   Target pixel size: {target_pixel_size_xy_nm:.2f} nm")
-                    # Sigma in target pixels will be calculated by ForwardModel scaling
-                    target_sigma_x = sigma_x_nm / target_pixel_size_xy_nm
-                    target_sigma_y = sigma_y_nm / target_pixel_size_xy_nm
-                    print(f"   Target PSF parameters (in target pixels): σx={target_sigma_x:.2f}, σy={target_sigma_y:.2f}")
-            else:
-                print(f"   PSF parameters (in pixels): σx={sigma_x:.2f}, σy={sigma_y:.2f}")
-            
-            # Convert to PSF object, preserving pixel size info
-            psf_array = psf_tensor.detach().cpu().numpy().astype(np.float32)
-            psf = PSF(psf_array=psf_array, pixel_size_xy_nm=psf_pixel_size_xy_nm)
-            
-        except Exception as e:
-            print(f"⚠️ Failed to load PSF from bead data: {e}")
-            print("   Falling back to Gaussian PSF")
-            # Fallback to Gaussian PSF
-            psf_config = getattr(cfg, "psf", {})
-            size = int(psf_config.get("size", 21))
-            sigma_x = float(psf_config.get("sigma_x", 2.0))
-            sigma_y = float(psf_config.get("sigma_y", 2.0))
-            
-            x = np.arange(size) - size // 2
-            y = np.arange(size) - size // 2
-            xx, yy = np.meshgrid(x, y)
-            psf_array = np.exp(-(xx ** 2 / (2 * sigma_x ** 2) + yy ** 2 / (2 * sigma_y ** 2)))
-            psf_array = psf_array.astype(np.float32)
-            
-            psf = PSF(psf_array=psf_array)
-            print(f"✅ Created fallback Gaussian PSF (σx={sigma_x}, σy={sigma_y})")
-            
-    elif use_psf:
-        # Load PSF from file path if specified
-        psf_path = getattr(physics_config, "psf_path", None)
-        if psf_path:
-            psf = PSF(psf_path=psf_path)
-            print(f"✅ Loaded PSF from file: {psf_path}")
-        else:
-            psf = PSF()
-            print("✅ Created default PSF")
-    else:
-        # Fallback to config-based Gaussian PSF
-        psf_config = getattr(cfg, "psf", {})
-        if psf_config.get("type") == "gaussian":
-            size = int(psf_config.get("size", 21))
-            sigma_x = float(psf_config.get("sigma_x", 2.0))
-            sigma_y = float(psf_config.get("sigma_y", 2.0))
-            
-            x = np.arange(size) - size // 2
-            y = np.arange(size) - size // 2
-            xx, yy = np.meshgrid(x, y)
-            psf_array = np.exp(-(xx ** 2 / (2 * sigma_x ** 2) + yy ** 2 / (2 * sigma_y ** 2)))
-            psf_array = psf_array.astype(np.float32)
-            
-            psf = PSF(psf_array=psf_array)
-            print(f"✅ Created Gaussian PSF (σx={sigma_x}, σy={sigma_y})")
-        else:
-            psf = PSF()
-            print("✅ Created default PSF")
-    
-    # Get target pixel size for PSF scaling
-    target_pixel_size_xy_nm = getattr(physics_config, "target_pixel_size_xy_nm", None)
-    if target_pixel_size_xy_nm is not None:
-        target_pixel_size_xy_nm = float(target_pixel_size_xy_nm)
-    
+    psf_obj, target_pixel_size_xy_nm = psf_from_config(physics_config)
     forward_model = ForwardModel(
-        psf=psf.to_torch(device=device),
-        background=float(physics_config.get("background", 0.0)),
+        psf=psf_obj.to_torch(device=device),
+        background=float(getattr(physics_config, "background", 0.0)),
         device=device,
         common_sizes=[(int(cfg.data.image_size), int(cfg.data.image_size))],
+        read_noise_sigma=float(getattr(physics_config, "read_noise_sigma", 0.0)),
         target_pixel_size_xy_nm=target_pixel_size_xy_nm
     )
 
     # Create datasets
-    use_zarr = bool(getattr(cfg.data, "use_zarr", False))
     use_self_supervised = bool(getattr(cfg.data, "use_self_supervised", True))
     use_adaptive_normalization = bool(getattr(cfg.data, "use_adaptive_normalization", False))
     
@@ -516,15 +410,6 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
                 "normalization/tp_improvement": tp_improvement
             })
             
-    elif use_zarr:
-        # Use Zarr format for large datasets
-        if not HAS_ZARR:
-            raise ImportError("Zarr support not available. Install zarr package to use this feature.")
-        zarr_train = data_dir / "zarr" / "train.zarr"
-        zarr_val = data_dir / "zarr" / "val.zarr"
-        train_dataset = ZarrPatchesDataset(str(zarr_train), transform=transform)
-        val_dataset = ZarrPatchesDataset(str(zarr_val), transform=transform)
-        print("✅ Using Zarr datasets")
     elif use_self_supervised:
         # Use true self-supervised learning with forward model
         # Check for proper train/val directory structure
@@ -652,40 +537,88 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         print("✅ Using data loaders from adaptive dataset creation")
     else:
         # Create data loaders for other dataset types
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
+        # Build DataLoader kwargs honoring pinning and pin_memory_device if available (PyTorch >= 2.3)
+        _pin_memory = bool(getattr(cfg.training, "pin_memory", True))
+        _pin_mem_dev = getattr(cfg.training, "dataloader_pin_memory_device", None)
+        _torch_version = tuple(int(p) for p in str(torch.__version__).split("+")[0].split(".")[:2])
+        _num_workers = int(cfg.training.num_workers)
+        _prefetch = int(getattr(cfg.training, "prefetch_factor", 4)) if _num_workers > 0 else None
+        _persistent = bool(getattr(cfg.training, "persistent_workers", True)) if _num_workers > 0 else False
+        dl_common_kwargs = dict(
             batch_size=int(cfg.training.batch_size),
             shuffle=True,
-            num_workers=int(cfg.training.num_workers),
-            pin_memory=True,
-            persistent_workers=bool(getattr(cfg.training, "persistent_workers", True)),
-            prefetch_factor=int(getattr(cfg.training, "prefetch_factor", 4)),
-            drop_last=True
+            num_workers=_num_workers,
+            pin_memory=_pin_memory,
+            drop_last=True,
+        )
+        if _persistent:
+            dl_common_kwargs["persistent_workers"] = True
+        if _prefetch is not None:
+            dl_common_kwargs["prefetch_factor"] = _prefetch
+        if _pin_mem_dev and _torch_version >= (2, 3) and torch.cuda.is_available():
+            dl_common_kwargs["pin_memory_device"] = str(_pin_mem_dev)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            **dl_common_kwargs,
         )
 
-        val_loader = torch.utils.data.DataLoader(
-            val_dataset,
+        dl_val_kwargs = dict(
             batch_size=int(cfg.training.batch_size),
             shuffle=False,
-            num_workers=int(cfg.training.num_workers),
-            pin_memory=True,
-            persistent_workers=bool(getattr(cfg.training, "persistent_workers", True)),
-            prefetch_factor=int(getattr(cfg.training, "prefetch_factor", 4)),
+            num_workers=_num_workers,
+            pin_memory=_pin_memory,
+        )
+        if _persistent:
+            dl_val_kwargs["persistent_workers"] = True
+        if _prefetch is not None:
+            dl_val_kwargs["prefetch_factor"] = _prefetch
+        if _pin_mem_dev and _torch_version >= (2, 3) and torch.cuda.is_available():
+            dl_val_kwargs["pin_memory_device"] = str(_pin_mem_dev)
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            **dl_val_kwargs,
         )
 
     # Create model
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
-    use_conditioning = bool(getattr(cfg.training, "use_conditioning", True))
+    use_conditioning = bool(getattr(cfg.training, "use_conditioning", False))
     
     # Ensure correct input channels for conditioning
     if use_conditioning and int(model_cfg.get("in_channels", 1)) == 1:
         model_cfg["in_channels"] = 2  # x_t + WF conditioner
 
+    # Propagate gradient checkpointing preference from training/optimization config into model config
+    try:
+        use_gc = bool(
+            getattr(cfg.training, "gradient_checkpointing", False)
+            or getattr(getattr(cfg, "optimization", {}), "use_gradient_checkpointing", False)
+            or getattr(getattr(cfg, "optimization", {}), "gradient_checkpointing", False)
+        )
+    except Exception:
+        use_gc = False
+    if use_gc:
+        model_cfg["gradient_checkpointing"] = True
+
     unet = UNet(model_cfg).to(device)
     print(f"✅ Created U-Net with {sum(p.numel() for p in unet.parameters()):,} parameters")
 
+    # Optionally compile the model with PyTorch 2.x
+    try:
+        if bool(getattr(cfg.training, "compile_model", False)):
+            compile_mode = getattr(cfg.training, "compile_mode", "reduce-overhead")
+            unet = torch.compile(unet, mode=compile_mode)
+            print(f"✅ torch.compile enabled (mode={compile_mode})")
+    except Exception as e:
+        print(f"⚠️ torch.compile failed or unavailable: {e}")
+
     # Create trainer
     training_cfg = OmegaConf.to_container(cfg.training, resolve=True)
+    # Propagate channels-last preference into training config for use in training steps
+    try:
+        if bool(getattr(getattr(cfg, "optimization", {}), "channels_last", False)):
+            training_cfg["channels_last"] = True
+    except Exception:
+        pass
     
     # Add self-supervised specific config if not present
     if "ddpm_loss_weight" not in training_cfg:
@@ -696,19 +629,161 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     if "perceptual_loss_weight" not in training_cfg:
         training_cfg["perceptual_loss_weight"] = 0.0
 
-    ddpm_trainer = DDPMTrainer(
-        model=unet,
-        config=training_cfg,
-        forward_model=forward_model,
-        transform=transform
-    ).to(device)
+    # Instantiate trainer (ProgressiveTrainer if enabled in cfg.model.multi_resolution.progressive)
+    use_progressive = False
+    progressive_section = {}
+    try:
+        mr_cfg = getattr(cfg.model, 'multi_resolution', {})
+        prog_cfg = getattr(mr_cfg, 'progressive', {})
+        use_progressive = bool(getattr(prog_cfg, 'enabled', False))
+        if use_progressive:
+            # Map YAML fields to trainer's progressive config
+            progressive_section = {
+                'enabled': True,
+                'max_resolution': int(getattr(prog_cfg, 'max_resolution', getattr(mr_cfg, 'target_resolution', getattr(cfg.model, 'sample_size', 128)))) ,
+                'start_resolution': int(getattr(mr_cfg, 'base_resolution', 64)),
+                'curriculum_type': str(getattr(prog_cfg, 'curriculum_type', 'linear')),
+                # epochs_per_resolution can be derived from steps_per_resolution if provided in YAML; fallback to small ints
+                # If steps_per_resolution provided and steps_per_epoch configured, map steps->epochs
+                'epochs_per_resolution': (lambda _prog=prog_cfg: (
+                    list(getattr(_prog, 'epochs_per_resolution', []))
+                    if list(getattr(_prog, 'epochs_per_resolution', []))
+                    else (
+                        (lambda steps, spe: [max(1, int(round(s / max(1, spe)))) for s in steps])(
+                            list(getattr(_prog, 'steps_per_resolution', [])),
+                            int(getattr(cfg.training, 'steps_per_epoch', 0))
+                        ) if list(getattr(_prog, 'steps_per_resolution', [])) else [10, 15, 20, 25]
+                    )
+                ))(),
+                'smooth_transitions': bool(getattr(prog_cfg, 'smooth_transitions', True)),
+                # YAML uses transition_steps; trainer expects transition_epochs. Map using steps_per_epoch when available
+                'transition_epochs': (lambda te_steps, spe: (
+                    int(max(1, int(round(te_steps / max(1, spe))))) if te_steps is not None and spe > 0 else int(getattr(prog_cfg, 'transition_epochs', 2))
+                ))(getattr(prog_cfg, 'transition_steps', None), int(getattr(cfg.training, 'steps_per_epoch', 0))),
+                'blend_mode': str(getattr(prog_cfg, 'blend_mode', 'alpha')),
+                'lr_scaling': bool(getattr(prog_cfg, 'lr_scaling', True)),
+                'lr_curriculum': str(getattr(prog_cfg, 'lr_curriculum', 'sqrt')),
+                'batch_scaling': bool(getattr(prog_cfg, 'batch_scaling', True)),
+                'adaptive_batch_scaling': bool(getattr(prog_cfg, 'adaptive_batch_scaling', True)),
+                'cross_resolution_consistency': bool(getattr(prog_cfg, 'cross_resolution_consistency', True)),
+                'consistency_weight': float(getattr(prog_cfg, 'consistency_weight', 0.1)),
+                # Pass through explicit resolution schedule if YAML provides one
+                'resolution_schedule': list(getattr(mr_cfg, 'resolutions', [])) or None,
+            }
+            # Also allow resolutions list from YAML to seed schedule in ProgressiveUNet via UNet.sample_size and trainer logic
+            # Note: ProgressiveTrainer computes schedule from max_resolution; we log YAML for info
+            print(f"✅ Progressive training enabled. YAML schedule: {list(getattr(mr_cfg, 'resolutions', []))}")
+    except Exception as e:
+        use_progressive = False
+        progressive_section = {}
+        print(f"⚠️ Progressive config parsing failed: {e}")
+
+    # Merge progressive section into training config for trainer consumption
+    if use_progressive:
+        training_cfg = {**training_cfg, 'progressive': progressive_section}
+        try:
+            from pkl_dg.models.progressive import ProgressiveTrainer
+            ddpm_trainer = ProgressiveTrainer(
+                model=unet,
+                config=training_cfg,
+                forward_model=forward_model,
+                transform=transform
+            ).to(device)
+            print("✅ Using ProgressiveTrainer")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize ProgressiveTrainer, falling back to DDPMTrainer: {e}")
+            ddpm_trainer = DDPMTrainer(
+                model=unet,
+                config=training_cfg,
+                forward_model=forward_model,
+                transform=transform
+            ).to(device)
+    else:
+        ddpm_trainer = DDPMTrainer(
+            model=unet,
+            config=training_cfg,
+            forward_model=forward_model,
+            transform=transform
+        ).to(device)
+
+    # Optionally wrap dataloaders with ProgressiveDataLoader if enabled in data cfg
+    try:
+        data_loading_cfg = getattr(cfg.data, 'data_loading', {})
+        mr_dl_cfg = getattr(data_loading_cfg, 'multi_resolution', {})
+        use_progressive_data = bool(getattr(mr_dl_cfg, 'enabled', False))
+    except Exception:
+        use_progressive_data = False
+
+    if use_progressive_data:
+        try:
+            from pkl_dg.models.progressive import ProgressiveDataLoader
+            # Build a resolution schedule from YAML if available
+            try:
+                mr_cfg = getattr(cfg.model, 'multi_resolution', {})
+                yaml_schedule = list(getattr(mr_cfg, 'resolutions', []))
+            except Exception:
+                yaml_schedule = []
+
+            # Prefer schedule passed to trainer via training_cfg['progressive'] if present
+            schedule_from_progressive = list(
+                training_cfg.get('progressive', {}).get('resolution_schedule', [])
+            ) if isinstance(training_cfg.get('progressive', {}), dict) else []
+
+            resolution_schedule = schedule_from_progressive or yaml_schedule
+            # Fallback to [cfg.model.sample_size] if nothing provided
+            if not resolution_schedule:
+                try:
+                    # Start at base_resolution if available
+                    base_res = int(getattr(getattr(cfg.model, 'multi_resolution', {}), 'base_resolution', 64))
+                    target_res = int(getattr(cfg.model, 'sample_size', 128))
+                    # Build doubling schedule up to target
+                    s = []
+                    cur = max(8, base_res)
+                    while cur < target_res:
+                        s.append(cur)
+                        cur *= 2
+                    s.append(target_res)
+                    resolution_schedule = s
+                except Exception:
+                    resolution_schedule = [int(getattr(cfg.model, 'sample_size', 128))]
+
+            # Wrap loaders
+            train_loader = ProgressiveDataLoader(train_loader, resolution_schedule)
+            val_loader = ProgressiveDataLoader(val_loader, resolution_schedule)
+            print(f"✅ Using ProgressiveDataLoader with schedule: {resolution_schedule}")
+        except Exception as e:
+            print(f"⚠️ Failed to enable ProgressiveDataLoader: {e}")
 
     # Setup optimizer and training parameters
-    optimizer = torch.optim.AdamW(
-        ddpm_trainer.parameters(),
-        lr=float(cfg.training.learning_rate),
-        weight_decay=float(getattr(cfg.training, "weight_decay", 1e-4))
-    )
+    # Optimizer with optional fused AdamW
+    _use_fused = bool(getattr(cfg.training, "use_fused_adam", False)) and torch.cuda.is_available()
+    try:
+        if _use_fused:
+            optimizer = torch.optim.AdamW(
+                ddpm_trainer.parameters(),
+                lr=float(cfg.training.learning_rate),
+                betas=(0.9, 0.999),
+                weight_decay=float(getattr(cfg.training, "weight_decay", 1e-6)),
+                fused=True,
+            )
+            print("✅ Using fused AdamW optimizer")
+        else:
+            optimizer = torch.optim.AdamW(
+                ddpm_trainer.parameters(),
+                lr=float(cfg.training.learning_rate),
+                betas=(0.9, 0.999),
+                weight_decay=float(getattr(cfg.training, "weight_decay", 1e-6))
+            )
+    except TypeError:
+        # Older PyTorch without fused kwarg support
+        optimizer = torch.optim.AdamW(
+            ddpm_trainer.parameters(),
+            lr=float(cfg.training.learning_rate),
+            betas=(0.9, 0.999),
+            weight_decay=float(getattr(cfg.training, "weight_decay", 1e-6))
+        )
+        if _use_fused:
+            print("⚠️ 'fused' AdamW not supported in this PyTorch version; falling back to standard AdamW")
 
     # Configure automatic mixed precision (AMP) based on config
     precision_str = str(getattr(cfg.training, "precision", "")).lower()
@@ -934,7 +1009,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
 
                 # Run sampling (may be heavy for large frames; best-effort only)
                 try:
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         pred = sampler.sample(
                             y=wf_t,
                             shape=tuple(wf_t.shape),
@@ -965,33 +1040,83 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
                 except Exception as e:
                     self._logger.warning(f"[Reconstruct @ {step}] Failed to save reconstruction: {e}")
         
-        # Model checkpoint callback - step-based saving (DDPM standard)
+        # Model checkpoint callback(s) - honor logging.* and training.checkpoint_config
+        logging_cfg = getattr(cfg, 'logging', {})
+        ckpt_cfg = getattr(cfg.training, 'checkpoint_config', {})
+        main_ckpt_cfg = getattr(ckpt_cfg, 'main_checkpoint', {})
+        inter_ckpt_cfg = getattr(ckpt_cfg, 'intermediate_checkpoint', {})
+        steps_list = getattr(cfg.training, 'checkpoint_every_n_steps', None)
+        save_intermediate = bool(getattr(cfg.training, 'save_intermediate_checkpoints', True))
+
+        # Resolve monitor metric with normalization (e.g., val_loss -> val/loss)
+        monitor_metric = str(
+            getattr(main_ckpt_cfg, 'monitor', None)
+            or getattr(logging_cfg, 'monitor_metric', 'val/loss')
+        )
+        if '/' not in monitor_metric and 'loss' in monitor_metric:
+            monitor_metric = monitor_metric.replace('_', '/')
+
+        # Resolve main checkpoint params
+        main_every_n = getattr(main_ckpt_cfg, 'every_n_train_steps', None)
+        if main_every_n is None:
+            if isinstance(steps_list, (list, tuple)) and len(steps_list) > 0:
+                try:
+                    main_every_n = int(max(steps_list))
+                except Exception:
+                    main_every_n = 10000
+            else:
+                main_every_n = 10000
+        main_save_top_k = int(
+            getattr(main_ckpt_cfg, 'save_top_k', None)
+            if getattr(main_ckpt_cfg, 'save_top_k', None) is not None
+            else getattr(logging_cfg, 'save_top_k', 3)
+        )
+        main_mode = str(getattr(main_ckpt_cfg, 'mode', 'min'))
+        main_filename = str(
+            getattr(main_ckpt_cfg, 'filename', f"ddpm-{{step:06d}}-{{{monitor_metric}:.4f}}")
+        )
+        main_save_last = bool(getattr(main_ckpt_cfg, 'save_last', True))
+
         checkpoint_callback = ModelCheckpoint(
             dirpath=checkpoint_dir,
-            filename='ddpm-{step:06d}-{val/loss:.4f}',
-            monitor='val/loss',  # Lightning uses 'val/loss' format
-            mode='min',
-            save_top_k=3,
-            save_last=True,
-            every_n_train_steps=10000,  # Save every 10K steps (main checkpoints)
+            filename=main_filename,
+            monitor=monitor_metric,
+            mode=main_mode,
+            save_top_k=main_save_top_k,
+            save_last=main_save_last,
+            every_n_train_steps=int(main_every_n),
             verbose=True
         )
         callbacks.append(checkpoint_callback)
+
+        # Intermediate checkpoint (optional)
+        if save_intermediate:
+            inter_every_n = getattr(inter_ckpt_cfg, 'every_n_train_steps', None)
+            if inter_every_n is None:
+                if isinstance(steps_list, (list, tuple)) and len(steps_list) > 0:
+                    try:
+                        inter_every_n = int(min(steps_list))
+                    except Exception:
+                        inter_every_n = 5000
+                else:
+                    inter_every_n = 5000
+            inter_save_top_k = int(getattr(inter_ckpt_cfg, 'save_top_k', -1))
+            inter_save_last = bool(getattr(inter_ckpt_cfg, 'save_last', False))
+            inter_filename = str(getattr(inter_ckpt_cfg, 'filename', 'ddpm-intermediate-{step:06d}'))
+
+            intermediate_checkpoint_callback = ModelCheckpoint(
+                dirpath=checkpoint_dir / "intermediate",
+                filename=inter_filename,
+                every_n_train_steps=int(inter_every_n),
+                save_top_k=inter_save_top_k,
+                save_last=inter_save_last,
+                verbose=False
+            )
+            callbacks.append(intermediate_checkpoint_callback)
         
-        # Intermediate checkpoint callback - more frequent saves for recovery
-        intermediate_checkpoint_callback = ModelCheckpoint(
-            dirpath=checkpoint_dir / "intermediate",
-            filename='ddpm-intermediate-{step:06d}',
-            every_n_train_steps=5000,  # Intermediate saves every 5K steps
-            save_top_k=-1,  # Save all checkpoints
-            save_last=False,  # Don't duplicate last checkpoint
-            verbose=False  # Less verbose for intermediate saves
-        )
-        callbacks.append(intermediate_checkpoint_callback)
-        
-        # Early stopping callback - step-based
+        # Early stopping callback - step-based (monitor same metric as checkpoints)
         early_stop_callback = EarlyStopping(
-            monitor='val/loss',  # Lightning uses 'val/loss' format
+            monitor=monitor_metric,
             patience=cfg.training.get('early_stopping_patience_steps', 10),  # 10 validation cycles
             min_delta=cfg.training.get('early_stopping_min_delta', 1e-5),
             mode='min',
@@ -1009,6 +1134,12 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         devices_arg = int(hw_cfg.get('devices', 1))
         strategy_arg = hw_cfg.get('strategy', 'auto')
         sync_bn = bool(hw_cfg.get('sync_batchnorm', False))
+
+        # Prefer logging.log_every_n_steps if provided
+        _log_every = int(
+            getattr(getattr(cfg, 'logging', {}), 'log_every_n_steps',
+                    int(cfg.training.get('log_every_n_steps', 100)))
+        )
 
         trainer = pl.Trainer(
             max_epochs=max_epochs,
@@ -1030,7 +1161,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
             logger=[l for l in [wandb_logger, csv_logger] if l is not None],
             gradient_clip_val=grad_clip_val,
             accumulate_grad_batches=int(cfg.training.get('accumulate_grad_batches', 1)),
-            log_every_n_steps=int(cfg.training.get('log_every_n_steps', 100)),
+            log_every_n_steps=_log_every,
             # Run validation every fixed number of training steps (int) or epoch fraction (float)
             val_check_interval=(
                 int(cfg.training.get('val_check_interval', cfg.training.get('val_check_interval_steps', 5000)))
@@ -1089,6 +1220,16 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         
         for epoch in range(max_epochs):
             ddpm_trainer.train()
+            # Update progressive data loader phase if enabled
+            try:
+                from pkl_dg.models.progressive import ProgressiveDataLoader as _PDL
+                if isinstance(train_loader, _PDL):
+                    # Ensure dataloader matches trainer's current phase
+                    train_loader.set_phase(getattr(ddpm_trainer, 'current_phase', 0))
+                if isinstance(val_loader, _PDL):
+                    val_loader.set_phase(getattr(ddpm_trainer, 'current_phase', 0))
+            except Exception:
+                pass
             epoch_loss = 0.0
             num_batches = 0
 
@@ -1101,7 +1242,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
                 else:
                     batch = batch.to(device, non_blocking=True)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
                 # Forward pass with mixed precision when enabled
                 if use_amp:
@@ -1158,7 +1299,8 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
             val_loss = 0.0
             val_batches = 0
             
-            with torch.no_grad():
+            with torch.inference_mode():
+                amp_cm = (autocast(dtype=amp_dtype) if use_amp else nullcontext())
                 val_progress = tqdm(val_loader, desc=f"Validation {epoch+1}/{max_epochs}", leave=False)
                 for val_batch_idx, val_batch in enumerate(val_progress):
                     # Move batch to device
@@ -1168,7 +1310,8 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
                         val_batch = val_batch.to(device, non_blocking=True)
                     
                     # Validation step
-                    val_step_loss = ddpm_trainer.validation_step(val_batch, val_batch_idx)
+                    with amp_cm:
+                        val_step_loss = ddpm_trainer.validation_step(val_batch, val_batch_idx)
                     val_loss += val_step_loss.item()
                     val_batches += 1
                     
@@ -1278,95 +1421,61 @@ def load_model_and_sampler(cfg: DictConfig, checkpoint_path: str, guidance_type:
             max_intensity=float(getattr(cfg.data, "max_intensity", 65535)),
         )
     
-    # Create guidance - use same PSF logic as training
+    # Create guidance - use same PSF logic as training via centralized helper
     physics_config = getattr(cfg, "physics", {})
-    use_psf = getattr(physics_config, "use_psf", False)
-    use_bead_psf = getattr(physics_config, "use_bead_psf", False)
-    
-    if use_psf and use_bead_psf:
-        # Load PSF from bead data
-        beads_dir = getattr(physics_config, "beads_dir", "data/beads")
-        try:
-            psf_bank = build_psf_bank(beads_dir)
-            bead_mode = getattr(physics_config, "bead_mode", None)
-            
-            if bead_mode and bead_mode in psf_bank:
-                psf_tensor = psf_bank[bead_mode]
-            elif "with_AO" in psf_bank:
-                psf_tensor = psf_bank["with_AO"]
-            elif "no_AO" in psf_bank:
-                psf_tensor = psf_bank["no_AO"]
-            else:
-                psf_tensor = next(iter(psf_bank.values()))
-            
-            psf_array = psf_tensor.detach().cpu().numpy().astype(np.float32)
-            psf = PSF(psf_array=psf_array)
-            
-        except Exception:
-            # Fallback to Gaussian PSF
-            psf_config = getattr(cfg, "psf", {})
-            size = int(psf_config.get("size", 21))
-            sigma_x = float(psf_config.get("sigma_x", 2.0))
-            sigma_y = float(psf_config.get("sigma_y", 2.0))
-            
-            x = np.arange(size) - size // 2
-            y = np.arange(size) - size // 2
-            xx, yy = np.meshgrid(x, y)
-            psf_array = np.exp(-(xx ** 2 / (2 * sigma_x ** 2) + yy ** 2 / (2 * sigma_y ** 2)))
-            psf_array = psf_array.astype(np.float32)
-            
-            psf = PSF(psf_array=psf_array)
-            
-    elif use_psf:
-        psf_path = getattr(physics_config, "psf_path", None)
-        if psf_path:
-            psf = PSF(psf_path=psf_path)
-        else:
-            psf = PSF()
-    else:
-        # Fallback to config-based Gaussian PSF
-        psf_config = getattr(cfg, "psf", {})
-        if psf_config.get("type") == "gaussian":
-            size = int(psf_config.get("size", 21))
-            sigma_x = float(psf_config.get("sigma_x", 2.0))
-            sigma_y = float(psf_config.get("sigma_y", 2.0))
-            
-            x = np.arange(size) - size // 2
-            y = np.arange(size) - size // 2
-            xx, yy = np.meshgrid(x, y)
-            psf_array = np.exp(-(xx ** 2 / (2 * sigma_x ** 2) + yy ** 2 / (2 * sigma_y ** 2)))
-            psf_array = psf_array.astype(np.float32)
-            
-            psf = PSF(psf_array=psf_array)
-        else:
-            psf = PSF()
-    
-    # Get target pixel size for PSF scaling
-    target_pixel_size_xy_nm = getattr(physics_config, "target_pixel_size_xy_nm", None)
-    if target_pixel_size_xy_nm is not None:
-        target_pixel_size_xy_nm = float(target_pixel_size_xy_nm)
-    
+    _psf_obj, target_pixel_size_xy_nm = psf_from_config(physics_config)
     forward_model = ForwardModel(
-        psf=psf.to_torch(device=device),
-        background=float(physics_config.get("background", 0.0)),
+        psf=_psf_obj.to_torch(device=device),
+        background=float(getattr(physics_config, "background", 0.0)),
         device=device,
+        read_noise_sigma=float(getattr(physics_config, "read_noise_sigma", 0.0)),
         target_pixel_size_xy_nm=target_pixel_size_xy_nm
     )
     
     guidance_cfg = getattr(cfg, "guidance", {})
-    if guidance_type == "pkl":
-        guidance = PKLGuidance(forward_model, **guidance_cfg)
-    elif guidance_type == "anscombe":
-        guidance = AnscombeGuidance(forward_model, **guidance_cfg)
+    # Build guidance strategy from type; constructors expect only their own params
+    gtype = str(guidance_type).lower()
+    if gtype == "pkl":
+        epsilon = float(guidance_cfg.get("epsilon", 1e-6))
+        guidance = PKLGuidance(epsilon=epsilon)
+    elif gtype == "kl":
+        sigma2 = float(guidance_cfg.get("sigma2", 1.0))
+        guidance = KLGuidance(sigma2=sigma2)
+    elif gtype == "anscombe":
+        epsilon = float(guidance_cfg.get("epsilon", 1e-6))
+        guidance = AnscombeGuidance(epsilon=epsilon)
     else:  # l2
-        guidance = L2Guidance(forward_model, **guidance_cfg)
+        guidance = L2Guidance()
+
+    # Build schedule (adaptive by default)
+    schedule_type = str(guidance_cfg.get("schedule_type", "adaptive")).lower()
+    if schedule_type == "adaptive":
+        lambda_base = float(guidance_cfg.get("lambda_base", 0.1))
+        T_threshold = int(guidance_cfg.get("schedule", {}).get("T_threshold", 800))
+        epsilon_lambda = float(guidance_cfg.get("schedule", {}).get("epsilon_lambda", 1e-3))
+        T_total = int(getattr(cfg.training, "num_timesteps", 1000))
+        schedule = AdaptiveSchedule(
+            lambda_base=lambda_base,
+            T_threshold=T_threshold,
+            epsilon_lambda=epsilon_lambda,
+            T_total=T_total,
+        )
+    else:
+        schedule = None
     
     # Create sampler
     sampler = DDIMSampler(
-        ddpm_trainer.model,
-        guidance=guidance,
+        model=ddpm_trainer,
+        forward_model=forward_model,
+        guidance_strategy=guidance,
+        schedule=schedule,
         transform=transform,
-        num_timesteps=int(getattr(cfg.training, "num_timesteps", 1000))
+        num_timesteps=int(getattr(cfg.training, "num_timesteps", 1000)),
+        ddim_steps=int(getattr(cfg.inference, "ddim_steps", 50)),
+        eta=float(getattr(cfg.inference, "eta", 0.0)),
+        use_autocast=bool(getattr(cfg.inference, "use_autocast", True)),
+        clip_denoised=True,
+        v_parameterization=bool(getattr(cfg.model, "learned_variance", False))
     )
     
     return sampler
@@ -1392,14 +1501,7 @@ def compute_baseline_metrics(wf_input: np.ndarray, gt: np.ndarray, psf: Optional
             print(f"⚠️ Richardson-Lucy failed: {e}")
             results["richardson_lucy"] = {"psnr": float('nan'), "ssim": float('nan'), "frc": float('nan')}
     
-    # RCAN baseline (if available)
-    if HAS_RCAN:
-        try:
-            # Note: This would require a trained RCAN model
-            # results["rcan"] = compute_standard_metrics(rcan_result, gt)
-            pass
-        except Exception:
-            pass
+    #
     
     return results
 
@@ -1439,7 +1541,12 @@ def run_evaluation(cfg: DictConfig, args) -> Dict[str, Dict[str, float]]:
     print(f"Found {len(image_paths)} images to evaluate")
     
     # Load models and samplers for different guidance types
-    guidance_types = ['l2', 'anscombe', 'pkl']
+    # Respect cfg.guidance.type if specified, otherwise evaluate all
+    cfg_type = str(getattr(getattr(cfg, 'guidance', {}), 'type', '')).lower()
+    if cfg_type in ['pkl', 'l2', 'anscombe', 'kl']:
+        guidance_types = [cfg_type]
+    else:
+        guidance_types = ['l2', 'anscombe', 'kl', 'pkl']
     samplers = {}
     
     for guidance_type in guidance_types:
@@ -1463,70 +1570,14 @@ def run_evaluation(cfg: DictConfig, args) -> Dict[str, Dict[str, float]]:
                 results[method_name][k] += float(v)
         counts[method_name] += 1
     
-    # Load PSF for baselines if available
+    # Load PSF for baselines and robustness if available (centralized helper)
     psf = None
-    if args.include_baselines:
-        physics_config = getattr(cfg, "physics", {})
-        use_psf = getattr(physics_config, "use_psf", False)
-        use_bead_psf = getattr(physics_config, "use_bead_psf", False)
-        
-        if use_psf and use_bead_psf:
-            # Load PSF from bead data
-            beads_dir = getattr(physics_config, "beads_dir", "data/beads")
-            try:
-                psf_bank = build_psf_bank(beads_dir)
-                bead_mode = getattr(physics_config, "bead_mode", None)
-                
-                if bead_mode and bead_mode in psf_bank:
-                    psf_tensor = psf_bank[bead_mode]
-                elif "with_AO" in psf_bank:
-                    psf_tensor = psf_bank["with_AO"]
-                elif "no_AO" in psf_bank:
-                    psf_tensor = psf_bank["no_AO"]
-                else:
-                    psf_tensor = next(iter(psf_bank.values()))
-                
-                psf_obj = PSF(psf_array=psf_tensor.detach().cpu().numpy().astype(np.float32))
-                psf = psf_obj.psf
-                
-            except Exception:
-                # Fallback to Gaussian PSF
-                psf_config = getattr(cfg, "psf", {})
-                if psf_config.get("type") == "gaussian":
-                    size = int(psf_config.get("size", 21))
-                    sigma_x = float(psf_config.get("sigma_x", 2.0))
-                    sigma_y = float(psf_config.get("sigma_y", 2.0))
-                    
-                    x = np.arange(size) - size // 2
-                    y = np.arange(size) - size // 2
-                    xx, yy = np.meshgrid(x, y)
-                    psf_array = np.exp(-(xx ** 2 / (2 * sigma_x ** 2) + yy ** 2 / (2 * sigma_y ** 2)))
-                    psf_array = psf_array.astype(np.float32)
-                    
-                    psf_obj = PSF(psf_array=psf_array)
-                    psf = psf_obj.psf
-                    
-        elif use_psf:
-            psf_path = getattr(physics_config, "psf_path", None)
-            if psf_path:
-                psf_obj = PSF(psf_path=psf_path)
-                psf = psf_obj.psf
-        else:
-            # Fallback to config-based Gaussian PSF
-            psf_config = getattr(cfg, "psf", {})
-            if psf_config.get("type") == "gaussian":
-                size = int(psf_config.get("size", 21))
-                sigma_x = float(psf_config.get("sigma_x", 2.0))
-                sigma_y = float(psf_config.get("sigma_y", 2.0))
-                
-                x = np.arange(size) - size // 2
-                y = np.arange(size) - size // 2
-                xx, yy = np.meshgrid(x, y)
-                psf_array = np.exp(-(xx ** 2 / (2 * sigma_x ** 2) + yy ** 2 / (2 * sigma_y ** 2)))
-                psf_array = psf_array.astype(np.float32)
-                
-                psf_obj = PSF(psf_array=psf_array)
-                psf = psf_obj.psf
+    physics_config = getattr(cfg, "physics", {})
+    try:
+        _psf_obj, _ = psf_from_config(physics_config)
+        psf = _psf_obj.psf
+    except Exception:
+        psf = None
     
     # Import centralized metrics once
     from pkl_dg.metrics import compute_standard_metrics as compute_evaluation_metrics
@@ -1590,6 +1641,75 @@ def run_evaluation(cfg: DictConfig, args) -> Dict[str, Dict[str, float]]:
                 diffusion_metrics = compute_evaluation_metrics(pred, gt)
                 accumulate_results(f"diffusion_{guidance_type}", diffusion_metrics)
                 
+                # Optional robustness tests (misalignment and PSF broadening) per guidance
+                if getattr(args, 'include_robustness_tests', False):
+                    # Misalignment: shift measurement by 1 pixel
+                    try:
+                        wf_shift = torch.roll(wf_tensor, shifts=(1, 1), dims=(-2, -1))
+                        pred_shift = sampler.sample(wf_shift, tuple(wf_shift.shape), device=device, verbose=False, conditioner=conditioner)
+                        pred_shift_np = pred_shift.squeeze().detach().cpu().numpy().astype(np.float32)
+                        mis_metrics = compute_evaluation_metrics(pred_shift_np, gt)
+                        accumulate_results(f"diffusion_{guidance_type}_misalign", mis_metrics)
+                    except Exception as e:
+                        print(f"⚠️ Misalignment test failed for {guidance_type}: {e}")
+
+                    # PSF broadening: lightly blur PSF before guidance
+                    try:
+                        if psf is not None:
+                            import torch.nn.functional as Fnn
+                            psf_t = torch.from_numpy(psf if isinstance(psf, np.ndarray) else np.array(psf)).float()
+                            if psf_t.ndim == 2:
+                                psf_t = psf_t.unsqueeze(0).unsqueeze(0)
+                            kernel = torch.ones((1, 1, 5, 5), device=psf_t.device, dtype=psf_t.dtype) / 25.0
+                            psf_blur = Fnn.conv2d(psf_t, kernel, padding=2)
+                            # Normalize
+                            psf_blur = psf_blur / (psf_blur.sum() + 1e-8)
+                            from pkl_dg.physics import ForwardModel
+                            fm_broad = ForwardModel(
+                                psf=psf_blur.squeeze(0).squeeze(0).to(device),
+                                background=float(getattr(physics_config, "background", 0.0)),
+                                device=device,
+                                read_noise_sigma=float(getattr(physics_config, "read_noise_sigma", 0.0))
+                            )
+                            # Temporarily swap forward model
+                            original_fm = getattr(sampler, 'forward_model', None)
+                            sampler.forward_model = fm_broad
+                            try:
+                                pred_broad = sampler.sample(wf_tensor, tuple(wf_tensor.shape), device=device, verbose=False, conditioner=conditioner)
+                                pred_broad_np = pred_broad.squeeze().detach().cpu().numpy().astype(np.float32)
+                                broad_metrics = compute_evaluation_metrics(pred_broad_np, gt)
+                                accumulate_results(f"diffusion_{guidance_type}_psf_broaden", broad_metrics)
+                            finally:
+                                sampler.forward_model = original_fm
+                    except Exception as e:
+                        print(f"⚠️ PSF broadening test failed for {guidance_type}: {e}")
+
+                # Optional downstream: Cellpose F1 and morphology (requires masks and cellpose)
+                if getattr(args, 'include_cellpose', False) and getattr(args, 'gt_masks_dir', None):
+                    try:
+                        from cellpose import models as _cp_models
+                        from pkl_dg.evaluation import average_precision as _avg_prec
+                        masks_dir = Path(args.gt_masks_dir)
+                        mask_path = masks_dir / img_path.name
+                        if mask_path.exists():
+                            gt_masks = tifffile.imread(str(mask_path)) if mask_path.suffix.lower() in ['.tif','.tiff'] else np.array(Image.open(mask_path))
+                            cp_model = _cp_models.Cellpose(model_type='cyto')
+                            pred_masks_list, _, _, _ = cp_model.eval([pred], diameter=None, channels=[0,0])
+                            pred_masks = pred_masks_list[0]
+                            ap, _, _, _ = _avg_prec(gt_masks, pred_masks)
+                            f1 = float(ap[0,5]) if ap.ndim >= 2 and ap.shape[1] > 5 else float(np.nan)
+                            # Hausdorff distance
+                            try:
+                                from pkl_dg.evaluation import DownstreamTasks as _DT
+                                hd = _DT.hausdorff_distance(pred_masks, gt_masks)
+                            except Exception:
+                                hd = float('nan')
+                            # Record
+                            accumulate_results(f"diffusion_{guidance_type}_cellpose_f1", {"psnr": f1, "ssim": float('nan'), "frc": float('nan')})
+                            accumulate_results(f"diffusion_{guidance_type}_hausdorff", {"psnr": hd, "ssim": float('nan'), "frc": float('nan')})
+                    except Exception as e:
+                        print(f"⚠️ Cellpose/morphology metrics failed: {e}")
+
             except Exception as e:
                 print(f"⚠️ Failed to evaluate {guidance_type}: {e}")
     
@@ -1619,9 +1739,261 @@ def run_evaluation(cfg: DictConfig, args) -> Dict[str, Dict[str, float]]:
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=2)
         print(f"💾 Results saved to: {results_path}")
+        
+        # Also save CSV summary for convenience
+        csv_path = output_dir / "evaluation_results.csv"
+        try:
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                # Header
+                header = ["method", "psnr", "ssim", "frc"]
+                writer.writerow(header)
+                # Rows
+                for method, metrics in final_results.items():
+                    writer.writerow([
+                        method,
+                        metrics.get("psnr", float('nan')),
+                        metrics.get("ssim", float('nan')),
+                        metrics.get("frc", float('nan')),
+                    ])
+            print(f"💾 CSV saved to: {csv_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to save CSV: {e}")
     
     return final_results
 
+
+def _parse_bool_list(value: Optional[str]) -> Optional[List[bool]]:
+    if value is None:
+        return None
+    tokens = [t.strip().lower() for t in value.split(',') if t.strip() != ""]
+    mapping = {"true": True, "t": True, "1": True, "yes": True, "y": True, "false": False, "f": False, "0": False, "no": False, "n": False}
+    result: List[bool] = []
+    for t in tokens:
+        if t not in mapping:
+            raise ValueError(f"Invalid boolean token in sweep list: {t}")
+        result.append(mapping[t])
+    return result
+
+
+def _parse_int_list(value: Optional[str]) -> Optional[List[int]]:
+    if value is None:
+        return None
+    return [int(t.strip()) for t in value.split(',') if t.strip() != ""]
+
+
+def _parse_float_list(value: Optional[str]) -> Optional[List[float]]:
+    if value is None:
+        return None
+    return [float(t.strip()) for t in value.split(',') if t.strip() != ""]
+
+
+def _parse_str_list(value: Optional[str]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    return [t.strip().lower() for t in value.split(',') if t.strip() != ""]
+
+
+def run_ablation(cfg: DictConfig, args) -> List[Dict[str, Union[str, float, int, bool]]]:
+    """Run ablation sweeps over requested configuration axes and save aggregated CSV/JSON.
+
+    The following axes are supported via CLI:
+      - guidance types
+      - PSF source (beads vs gaussian)
+      - conditioning on/off
+      - adaptive normalization on/off
+      - num_timesteps (ints)
+      - learned_variance on/off
+      - EMA on/off
+      - cycle_loss_weight (floats)
+    """
+    print("🧪 Starting Ablation Sweeps")
+    print("=" * 50)
+
+    # Resolve base values from cfg if sweeps not provided
+    guidance_list = _parse_str_list(getattr(args, 'sweep_guidance', None))
+    if not guidance_list:
+        # Evaluate all by default if not specified
+        guidance_list = ['l2', 'anscombe', 'kl', 'pkl']
+
+    psf_sources = _parse_str_list(getattr(args, 'sweep_psf_source', None))
+    if not psf_sources:
+        use_bead = bool(getattr(cfg.physics, 'use_bead_psf', False)) if hasattr(cfg, 'physics') else False
+        psf_sources = ['beads' if use_bead else 'gaussian']
+
+    conditioning_list = _parse_bool_list(getattr(args, 'sweep_conditioning', None))
+    if conditioning_list is None:
+        conditioning_list = [bool(getattr(cfg.training, 'use_conditioning', False))]
+
+    adaptive_norm_list = _parse_bool_list(getattr(args, 'sweep_adaptive_normalization', None))
+    if adaptive_norm_list is None:
+        adaptive_norm_list = [bool(getattr(cfg.data, 'use_adaptive_normalization', False))]
+
+    num_timesteps_list = _parse_int_list(getattr(args, 'sweep_num_timesteps', None))
+    if num_timesteps_list is None:
+        num_timesteps_list = [int(getattr(cfg.training, 'num_timesteps', 1000))]
+
+    learned_variance_list = _parse_bool_list(getattr(args, 'sweep_learned_variance', None))
+    if learned_variance_list is None:
+        learned_variance_list = [bool(getattr(cfg.model, 'learned_variance', False))]
+
+    ema_list = _parse_bool_list(getattr(args, 'sweep_ema', None))
+    if ema_list is None:
+        ema_list = [bool(getattr(cfg.training, 'use_ema', True))]
+
+    cycle_weight_list = _parse_float_list(getattr(args, 'sweep_cycle_weight', None))
+    if cycle_weight_list is None:
+        cycle_weight_list = [float(getattr(cfg.training, 'cycle_loss_weight', 0.1))]
+
+    # Prepare output directory and run stamp
+    base_output = Path(args.output_dir) if args.output_dir else (Path(getattr(cfg.paths, 'outputs', 'outputs')))
+    ablate_dir = base_output / 'ablations'
+    ablate_dir.mkdir(parents=True, exist_ok=True)
+    config_name = Path(args.config).stem if args.config else 'default'
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    # Cartesian product of all axes
+    # Optional guidance parameter sweeps
+    lambda_list = _parse_float_list(getattr(args, 'sweep_guidance_lambda', None)) or [float(getattr(getattr(cfg, 'guidance', {}), 'lambda_base', 0.1))]
+    Tthr_list = _parse_int_list(getattr(args, 'sweep_guidance_Tthr', None)) or [int(getattr(getattr(getattr(cfg, 'guidance', {}), 'schedule', {}), 'T_threshold', 800))]
+    epslambda_list = _parse_float_list(getattr(args, 'sweep_guidance_epslambda', None)) or [float(getattr(getattr(getattr(cfg, 'guidance', {}), 'schedule', {}), 'epsilon_lambda', 1e-3))]
+
+    axes = [
+        ('guidance', guidance_list),
+        ('psf_source', psf_sources),
+        ('conditioning', conditioning_list),
+        ('adaptive_norm', adaptive_norm_list),
+        ('num_timesteps', num_timesteps_list),
+        ('learned_variance', learned_variance_list),
+        ('use_ema', ema_list),
+        ('cycle_loss_weight', cycle_weight_list),
+        ('lambda_base', lambda_list),
+        ('T_threshold', Tthr_list),
+        ('epsilon_lambda', epslambda_list),
+    ]
+    key_names = [k for k, _ in axes]
+    value_lists = [v for _, v in axes]
+
+    results_rows: List[Dict[str, Union[str, float, int, bool]]] = []
+
+    combos = itertools.product(*value_lists)
+    for combo in combos:
+        # Build variant configuration
+        variant_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        variant = dict(zip(key_names, combo))
+
+        # Apply variant settings
+        # Guidance
+        if not hasattr(variant_cfg, 'guidance'):
+            variant_cfg.guidance = {}
+        variant_cfg.guidance.type = str(variant['guidance'])
+        variant_cfg.guidance.lambda_base = float(variant['lambda_base'])
+        if not hasattr(variant_cfg.guidance, 'schedule'):
+            variant_cfg.guidance.schedule = {}
+        variant_cfg.guidance.schedule.T_threshold = int(variant['T_threshold'])
+        variant_cfg.guidance.schedule.epsilon_lambda = float(variant['epsilon_lambda'])
+
+        # PSF source
+        if not hasattr(variant_cfg, 'physics'):
+            variant_cfg.physics = {}
+        if str(variant['psf_source']) == 'beads':
+            variant_cfg.physics.use_bead_psf = True
+        else:
+            variant_cfg.physics.use_bead_psf = False
+            # Ensure PSF type is gaussian when not using beads
+            if not hasattr(variant_cfg, 'psf'):
+                variant_cfg.psf = {}
+            variant_cfg.psf.type = 'gaussian'
+
+        # Conditioning
+        if not hasattr(variant_cfg, 'training'):
+            variant_cfg.training = {}
+        variant_cfg.training.use_conditioning = bool(variant['conditioning'])
+
+        # Adaptive normalization
+        if not hasattr(variant_cfg, 'data'):
+            variant_cfg.data = {}
+        variant_cfg.data.use_adaptive_normalization = bool(variant['adaptive_norm'])
+
+        # Timesteps
+        variant_cfg.training.num_timesteps = int(variant['num_timesteps'])
+
+        # Learned variance
+        if not hasattr(variant_cfg, 'model'):
+            variant_cfg.model = {}
+        variant_cfg.model.learned_variance = bool(variant['learned_variance'])
+
+        # EMA
+        variant_cfg.training.use_ema = bool(variant['use_ema'])
+
+        # Cycle loss weight
+        variant_cfg.training.cycle_loss_weight = float(variant['cycle_loss_weight'])
+
+        # Prepare per-variant output directory with stamped, config-named run directory
+        run_name = (
+            f"{config_name}__guid_{variant['guidance']}__psf_{variant['psf_source']}"
+            f"__cond_{int(bool(variant['conditioning']))}__adapt_{int(bool(variant['adaptive_norm']))}"
+            f"__T_{variant['num_timesteps']}__lv_{int(bool(variant['learned_variance']))}"
+            f"__ema_{int(bool(variant['use_ema']))}__cycle_{variant['cycle_loss_weight']}"
+            f"__lam_{variant['lambda_base']}__Tthr_{variant['T_threshold']}__epsl_{variant['epsilon_lambda']}__{stamp}"
+        )
+        out_dir_variant = ablate_dir / run_name
+        out_dir_variant.mkdir(parents=True, exist_ok=True)
+
+        # Run evaluation for this variant
+        prev_output_dir = args.output_dir
+        prev_guidance_type = getattr(args, 'guidance_type', None)
+        try:
+            args.output_dir = str(out_dir_variant)
+            # Ensure we do not override guidance via CLI; use cfg's guidance.type
+            args.guidance_type = None
+            eval_results = run_evaluation(variant_cfg, args)
+        finally:
+            args.output_dir = prev_output_dir
+            args.guidance_type = prev_guidance_type
+
+        # Flatten results into rows (one row per method)
+        for method, metrics in eval_results.items():
+            row: Dict[str, Union[str, float, int, bool]] = {
+                'run_name': run_name,
+                'method': method,
+                'guidance': str(variant['guidance']),
+                'psf_source': str(variant['psf_source']),
+                'conditioning': bool(variant['conditioning']),
+                'adaptive_norm': bool(variant['adaptive_norm']),
+                'num_timesteps': int(variant['num_timesteps']),
+                'learned_variance': bool(variant['learned_variance']),
+                'use_ema': bool(variant['use_ema']),
+                'cycle_loss_weight': float(variant['cycle_loss_weight']),
+                'psnr': float(metrics.get('psnr', float('nan'))),
+                'ssim': float(metrics.get('ssim', float('nan'))),
+                'frc': float(metrics.get('frc', float('nan'))),
+                'lambda_base': float(variant['lambda_base']),
+                'T_threshold': int(variant['T_threshold']),
+                'epsilon_lambda': float(variant['epsilon_lambda']),
+            }
+            results_rows.append(row)
+
+    # Save aggregated ablation CSV and JSON
+    agg_csv = ablate_dir / f"ablations_{config_name}_{stamp}.csv"
+    try:
+        with open(agg_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(results_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(results_rows)
+        print(f"💾 Ablation CSV saved to: {agg_csv}")
+    except Exception as e:
+        print(f"⚠️ Failed to save ablation CSV: {e}")
+
+    agg_json = ablate_dir / f"ablations_{config_name}_{stamp}.json"
+    try:
+        with open(agg_json, 'w') as f:
+            json.dump(results_rows, f, indent=2)
+        print(f"💾 Ablation JSON saved to: {agg_json}")
+    except Exception as e:
+        print(f"⚠️ Failed to save ablation JSON: {e}")
+
+    return results_rows
 
 def main():
     """Main entry point."""
@@ -1634,7 +2006,7 @@ def main():
     # Mode selection
     parser.add_argument(
         '--mode', '-m',
-        choices=['train', 'eval', 'train_eval'],
+        choices=['train', 'eval', 'train_eval', 'ablate'],
         required=True,
         help='Operation mode: train, eval, or train_eval (train then evaluate)'
     )
@@ -1670,6 +2042,25 @@ def main():
     parser.add_argument('--eval-input', type=str, help='Input directory for train_eval mode')
     parser.add_argument('--eval-gt', type=str, help='Ground truth directory for train_eval mode')
     parser.add_argument('--include-baselines', action='store_true', help='Include baseline methods in evaluation')
+    parser.add_argument('--guidance-type', type=str, choices=['pkl','kl','l2','anscombe'], help='Override guidance.type for inference/eval')
+    
+    # Ablation sweep arguments (comma-separated lists for values)
+    parser.add_argument('--sweep-guidance', type=str, help='Comma-separated guidance types to sweep (e.g., pkl,kl,l2,anscombe)')
+    parser.add_argument('--sweep-psf-source', type=str, help="Comma-separated PSF sources to sweep: 'beads' or 'gaussian'")
+    parser.add_argument('--sweep-conditioning', type=str, help='Comma-separated booleans for conditioning (e.g., true,false)')
+    parser.add_argument('--sweep-adaptive-normalization', type=str, help='Comma-separated booleans for adaptive normalization (e.g., true,false)')
+    parser.add_argument('--sweep-num-timesteps', type=str, help='Comma-separated timesteps (e.g., 250,500,1000)')
+    parser.add_argument('--sweep-learned-variance', type=str, help='Comma-separated booleans for learned variance (e.g., true,false)')
+    parser.add_argument('--sweep-ema', type=str, help='Comma-separated booleans for EMA (e.g., true,false)')
+    parser.add_argument('--sweep-cycle-weight', type=str, help='Comma-separated cycle loss weights (e.g., 0.05,0.1,0.2)')
+    # Guidance parameter sweeps
+    parser.add_argument('--sweep-guidance-lambda', type=str, help='Comma-separated lambda_base values for guidance (e.g., 0.05,0.1,0.2)')
+    parser.add_argument('--sweep-guidance-Tthr', type=str, help='Comma-separated T_threshold values (e.g., 600,800,900)')
+    parser.add_argument('--sweep-guidance-epslambda', type=str, help='Comma-separated epsilon_lambda values (e.g., 1e-4,1e-3,1e-2)')
+    # Optional robustness and downstream flags
+    parser.add_argument('--include-robustness-tests', action='store_true', help='Run misalignment and PSF-broadening tests during evaluation')
+    parser.add_argument('--include-cellpose', action='store_true', help='Run Cellpose/morphology metrics if masks available')
+    parser.add_argument('--gt-masks-dir', type=str, help='Directory with ground-truth masks for Cellpose/morphology metrics')
     
     # Logging
     parser.add_argument('--wandb-mode', choices=['online', 'offline', 'disabled'], help='W&B logging mode')
@@ -1686,6 +2077,12 @@ def main():
     
     if args.mode == 'train_eval' and not (args.eval_input and args.eval_gt):
         parser.error("--eval-input and --eval-gt are required for train_eval mode")
+    
+    if args.mode == 'ablate':
+        if not args.config:
+            parser.error("--config is required for ablate mode")
+        if not (args.input_dir and args.gt_dir):
+            parser.error("--input-dir and --gt-dir are required for ablate mode")
     
     try:
         # Setup experiment
@@ -1715,8 +2112,21 @@ def main():
                 checkpoint = torch.load(args.checkpoint, map_location='cpu')
                 cfg = checkpoint['config']
             
+            # Optional guidance-type override
+            if args.guidance_type:
+                if not hasattr(cfg, 'guidance'):
+                    cfg.guidance = {}
+                cfg.guidance.type = args.guidance_type
+            
             results = run_evaluation(cfg, args)
             print("🎉 Evaluation completed successfully!")
+        
+        # Run ablations
+        if args.mode == 'ablate':
+            # Always load cfg from provided config for ablations
+            cfg = setup_experiment(args)
+            run_ablation(cfg, args)
+            print("🎉 Ablations completed successfully!")
         
         return 0
         

@@ -159,10 +159,8 @@ metrics:
 
 # Baseline methods configuration
 baselines:
-  rcan_checkpoint: null  # Set path to RCAN checkpoint if available
   richardson_lucy_iterations: 30
   use_richardson_lucy: true
-  use_rcan: false
 
 # Cross-method analysis paths - only used when mode=cross_method_analysis
 cross_analysis:
@@ -170,7 +168,6 @@ cross_analysis:
   l2_dir: "outputs/l2_results"
   anscombe_dir: "outputs/anscombe_results"
   rl_dir: "outputs/rl_results"
-  rcan_dir: "outputs/rcan_results"
 
 # Weights & Biases configuration
 wandb:
