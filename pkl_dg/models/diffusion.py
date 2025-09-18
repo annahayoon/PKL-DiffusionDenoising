@@ -345,22 +345,10 @@ class DDPMTrainer(LightningModuleBase):
             "prediction_type": "epsilon",
         }
         
-        # Create the appropriate scheduler
-        if scheduler_type == "ddim":
+        # Create the appropriate scheduler (disable DPMSolver++ by default; fall back to DDIM)
+        if scheduler_type in ("ddim", "dpm_solver"):
+            # Use DDIM for both 'ddim' and 'dpm_solver' selections to avoid dependency/instability
             self.scheduler = DDIMScheduler(**scheduler_config)
-        elif scheduler_type == "dpm_solver":
-            # DPM-Solver specific config
-            dpm_config = {
-                "num_train_timesteps": self.num_timesteps,
-                "beta_start": 0.0001,
-                "beta_end": 0.02,
-                "beta_schedule": "squaredcos_cap_v2" if self.beta_schedule == "cosine" else self.beta_schedule,
-                "prediction_type": "epsilon",
-                "algorithm_type": "dpmsolver++",
-                "solver_order": 2,
-                "use_karras_sigmas": bool(self.config.get("use_karras_sigmas", True)),
-            }
-            self.scheduler = DPMSolverMultistepScheduler(**dpm_config)
         else:  # Default to DDPM
             self.scheduler = DDPMScheduler(**scheduler_config)
         

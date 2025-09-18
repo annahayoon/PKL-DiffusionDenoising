@@ -112,7 +112,7 @@ To ensure clarity and reproducibility, we enumerate the key design decisions tha
     \item \textbf{Guidance ramp:} $T_{\text{thr}}$ controls warm-up; we ablate linear vs. cosine ramps and thresholds.
     \item \textbf{Forward model fidelity:} Measured PSFs are used by default; we ablate against Gaussian PSFs and broadened/mismatched PSFs to assess robustness. We resample PSFs to match image pixel size when needed.
     \item \textbf{Alignment:} We quantify tolerance to small misregistrations by evaluating on imperfectly registered pairs.
-    \item \textbf{Diffusion options:} Learned variance and EMA are toggled per configuration; we report their effect. Mixed precision and memory optimizations (channels-last, gradient checkpointing) are used as engineering choices and ablated when relevant. For inference we employ a fast DPMSolver++ scheduler and apply guidance in the $\hat{\mathbf{x}}_0$ domain each step.
+    \item \textbf{Diffusion options:} Learned variance and EMA are toggled per configuration; we report their effect. Mixed precision and memory optimizations (channels-last, gradient checkpointing) are used as engineering choices and ablated when relevant. For inference we employ a stable DDIM scheduler (DPMSolver++ disabled by default) and apply guidance in the $\hat{\mathbf{x}}_0$ domain each step.
 \end{itemize}
 These points address prior “method detail gaps” by specifying normalization, numerical safeguards, and forward-model usage.
 
@@ -146,7 +146,7 @@ We compare to:
 \textit{Note:} We omit RCAN supervision because our data are single-channel grayscale; channel-attention architectures are not directly applicable or competitive under our constraints.
 
 \subsection{Evaluation Protocol \& Results}
-\textbf{Reconstruction Fidelity and Resolution.} We report PSNR, SSIM, and Fourier Ring Correlation (FRC).
+\textbf{Reconstruction Fidelity and Resolution.} We report PSNR, SSIM, and Fourier Ring Correlation (FRC). We also report optional downstream metrics (Cellpose F1 at IoU$\ge 0.5$ with a greedy fallback) and morphology (Hausdorff distance) when masks are available.
 
 % [Table 1 Placeholder: Quantitative comparison across methods]
 % Columns: Method, PSNR$\uparrow$, SSIM$\uparrow$, FRC (nm)$\downarrow$.

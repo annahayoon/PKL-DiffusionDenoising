@@ -1,7 +1,7 @@
 ## Updated Design: Microscopy Diffusion Training/Evaluation (`scripts/run_microscopy.py` + `configs/multi_gpu_config.yaml`)
 
 ### 0) Primary mapping and PSF usage
-- **Primary mapping**: Default is an unconditional diffusion prior over 2P; WF enters primarily via the physics model (guidance/consistency). The PSF is external to the UNet. Optional explicit WF conditioning is supported by setting `training.use_conditioning=true` (then `UNet` concatenates a conditioner channel), but remains disabled in the default configs.
+- **Primary mapping**: Default is an unconditional diffusion prior over 2P; WF enters primarily via the physics model (guidance/consistency). The PSF is external to the UNet. Optional explicit WF conditioning is supported by setting `training.use_conditioning=true` (then `UNet` concatenates a conditioner channel), but is disabled by default (`training.use_conditioning=false`).
 - **Where PSF is used**:
   - Training consistency (self-supervised, optional/light): simulate WF by convolving the (predicted) 2P image with the PSF via `ForwardModel`; define a small loss in the WF domain. Enabled via `training.use_forward_consistency` with a small `forward_consistency_weight` and warmup.
   - Inference guidance: L2/KL/PKL guidance compares the forward projection of the current 2P estimate against the observed WF to steer sampling.
@@ -50,13 +50,13 @@
 - **PSF/Forward model**
   - Sources: measured PSF from beads (preferred) or Gaussian fallback from `cfg.psf`.
   - Wrapped in `pkl_dg.physics.PSF`, consumed by `pkl_dg.physics.ForwardModel` with optional pixel-size scaling when PSF and image pixel sizes differ.
-  - Background `B` comes from `cfg.physics.background`; optional read-noise `σ_read` can be set via `cfg.physics.read_noise_sigma` and is used by PKL guidance.
+  - Background `B` comes from `cfg.physics.background`; optional read-noise `σ_read` is wired via `cfg.physics.read_noise_sigma` and used by PKL guidance.
   - Training: optional small forward-consistency by convolving (predicted) 2P with PSF to form a loss in the WF domain.
 - **Guidance at inference**
   - Supported: **Poisson‑guided KL (PKL)**, plain **KL**, and **L2** (with optional Anscombe variance stabilization).
-  - `load_model_and_sampler` builds a fast scheduler-backed sampler (DPMSolver++ by default) with the selected guidance, which compares forward projections to observed WF each step in the x₀ domain.
+  - `load_model_and_sampler` builds a sampler using a stable DDIM scheduler (DPMSolver++ disabled by default). Guidance compares forward projections to observed WF each step in the x₀ domain.
   - Configure via YAML (`guidance.type: pkl|kl|l2|anscombe`) or override at CLI with `--guidance-type {pkl,kl,l2,anscombe}`; if unset, evaluation can run multiple guidance types.
-  - Adaptive schedule: `guidance.schedule_type=adaptive` with `lambda_base`, `schedule.T_threshold`, and `schedule.epsilon_lambda` normalizes by the gradient norm and ramps guidance late for stability.
+  - Adaptive schedule: `guidance.schedule_type=adaptive` with `lambda_base`, `schedule.T_threshold`, and `schedule.epsilon_lambda` normalizes by the gradient norm and ramps guidance late for stability. These can be swept in ablations via `--sweep-guidance-lambda`, `--sweep-guidance-Tthr`, and `--sweep-guidance-epslambda`.
 
 Note on defaults
 - The default configs train an unconditional 2P prior and enable a small forward-consistency regularizer (weight ≈ 0.01 with warmup). WF is used strongly at inference via physics-guided sampling; default guidance is `pkl` from YAML unless overridden at the CLI.
@@ -82,8 +82,10 @@ Note on defaults
 - **Evaluation & Ablations**
   - Runs the selected guidance sampler (`guidance.type` or `--guidance-type`) and aggregates PSNR/SSIM/FRC. If no type is specified, the script can evaluate multiple guidance types.
   - Optional RL baseline when PSF is available.
+  - Robustness tests: optional misalignment and PSF broadening tests via `--include-robustness-tests`.
+  - Downstream metrics: optional Cellpose F1 (IoU≥0.5 fallback) and Hausdorff via `--include-cellpose --gt-masks-dir <dir>`.
   - Saves `evaluation_results.{json,csv}` to `--output-dir`.
-  - Ablation sweeps via `--mode ablate` with CLI axes over guidance, PSF source, conditioning, adaptive normalization, `num_timesteps`, learned variance, EMA, and `cycle_loss_weight`. Each combo saves results under `outputs/ablations/<config-stamped-run>/evaluation_results.{json,csv}` and writes aggregated `ablations_<config_name>_<timestamp>.{csv,json}`.
+  - Ablation sweeps via `--mode ablate` with CLI axes over guidance, PSF source, conditioning, adaptive normalization, `num_timesteps`, learned variance, EMA, `cycle_loss_weight`, and guidance schedule params (`lambda_base`, `T_threshold`, `epsilon_lambda`). Each combo saves results under `outputs/ablations/<config-stamped-run>/evaluation_results.{json,csv}` and writes aggregated `ablations_<config_name>_<timestamp>.{csv,json}`.
 
 ### 4) Baselines
 - **Wide-field passthrough**: raw WF vs GT (sanity baseline).

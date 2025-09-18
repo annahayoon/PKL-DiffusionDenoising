@@ -195,8 +195,7 @@ def setup_experiment(args, cfg: Optional[DictConfig] = None) -> DictConfig:
 
 def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     """Run training workflow."""
-    print("🚀 Starting Training Phase")
-    print("=" * 50)
+    print("🚀 Starting Training Phase\n" + "=" * 50)
     
     # Set seed for reproducibility
     seed = int(cfg.experiment.seed)
@@ -293,7 +292,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     )
     logger = logging.getLogger(__name__)
     logger.info(f"Starting training with config: {cfg.experiment.name}")
-    print(f"✅ Initialized file logging: {log_file}")
+    print(f"✅ File logging: {log_file}")
 
     # If W&B is active, ensure the run name matches the file log stem for consistency
     try:
@@ -302,10 +301,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     except Exception:
         pass
     
-    print(f"Device: {device}")
-    print(f"Data directory: {data_dir}")
-    print(f"Checkpoint directory: {checkpoint_dir}")
-    print(f"Training logs: {log_file}")
+    print(f"Device: {device}\nData: {data_dir}\nCheckpoints: {checkpoint_dir}\nLogs: {log_file}")
 
     # Setup outputs directory for saving reconstructions/visualizations
     if Path(cfg.paths.outputs).is_absolute():
@@ -1688,7 +1684,6 @@ def run_evaluation(cfg: DictConfig, args) -> Dict[str, Dict[str, float]]:
                 if getattr(args, 'include_cellpose', False) and getattr(args, 'gt_masks_dir', None):
                     try:
                         from cellpose import models as _cp_models
-                        from pkl_dg.evaluation import average_precision as _avg_prec
                         masks_dir = Path(args.gt_masks_dir)
                         mask_path = masks_dir / img_path.name
                         if mask_path.exists():
@@ -1696,8 +1691,47 @@ def run_evaluation(cfg: DictConfig, args) -> Dict[str, Dict[str, float]]:
                             cp_model = _cp_models.Cellpose(model_type='cyto')
                             pred_masks_list, _, _, _ = cp_model.eval([pred], diameter=None, channels=[0,0])
                             pred_masks = pred_masks_list[0]
-                            ap, _, _, _ = _avg_prec(gt_masks, pred_masks)
-                            f1 = float(ap[0,5]) if ap.ndim >= 2 and ap.shape[1] > 5 else float(np.nan)
+                            # Compute F1 at IoU 0.5 (greedy matching) as fallback if average_precision is unavailable
+                            def _f1_iou50(gt_m, pr_m):
+                                gt_labels = np.unique(gt_m)[1:]
+                                pr_labels = np.unique(pr_m)[1:]
+                                if gt_labels.size == 0 and pr_labels.size == 0:
+                                    return 1.0
+                                if gt_labels.size == 0 or pr_labels.size == 0:
+                                    return 0.0
+                                # Build IoU matrix
+                                iou = np.zeros((gt_labels.size, pr_labels.size), dtype=np.float32)
+                                for i, gl in enumerate(gt_labels):
+                                    g = (gt_m == gl)
+                                    g_sum = g.sum()
+                                    if g_sum == 0:
+                                        continue
+                                    for j, pl in enumerate(pr_labels):
+                                        p = (pr_m == pl)
+                                        inter = np.logical_and(g, p).sum()
+                                        union = g_sum + p.sum() - inter
+                                        iou[i, j] = inter / union if union > 0 else 0.0
+                                # Greedy match
+                                matched_gt = set()
+                                matched_pr = set()
+                                tp = 0
+                                while True:
+                                    idx = np.unravel_index(np.argmax(iou), iou.shape)
+                                    if iou[idx] < 0.5:
+                                        break
+                                    if idx[0] in matched_gt or idx[1] in matched_pr:
+                                        iou[idx] = -1
+                                        continue
+                                    matched_gt.add(idx[0])
+                                    matched_pr.add(idx[1])
+                                    tp += 1
+                                    iou[idx] = -1
+                                fp = pr_labels.size - tp
+                                fn = gt_labels.size - tp
+                                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                                return (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+                            f1 = float(_f1_iou50(gt_masks, pred_masks))
                             # Hausdorff distance
                             try:
                                 from pkl_dg.evaluation import DownstreamTasks as _DT
