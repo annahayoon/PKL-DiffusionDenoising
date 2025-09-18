@@ -513,39 +513,43 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         print("✅ Using Zarr datasets")
     elif use_self_supervised:
         # Use true self-supervised learning with forward model
-        # Check for paired directory structure first
-        wf_dir = data_dir / "wf" 
-        twop_dir = data_dir / "2p"
+        # Check for proper train/val directory structure
+        train_wf_dir = data_dir / "train" / "wf"
+        train_twop_dir = data_dir / "train" / "2p"
+        val_wf_dir = data_dir / "val" / "wf"
+        val_twop_dir = data_dir / "val" / "2p"
         
-        if not wf_dir.exists() or not twop_dir.exists():
-            raise ValueError(f"For self-supervised learning, both 'wf' and '2p' directories must exist in {data_dir}")
+        if not all([train_wf_dir.exists(), train_twop_dir.exists(), val_wf_dir.exists(), val_twop_dir.exists()]):
+            raise ValueError(f"Missing train/val directories. Expected: {data_dir}/{{train,val}}/{{wf,2p}}")
         
         # Check if we should use paired data for comparison
         use_paired = bool(getattr(cfg.data, "use_paired_for_validation", False))
         use_forward_model = not use_paired  # Use forward model unless explicitly using paired data
         
         train_dataset = UnpairedDataset(
-            wf_dir=str(wf_dir),
-            twop_dir=str(twop_dir),
+            wf_dir=str(train_wf_dir),
+            twop_dir=str(train_twop_dir),
             transform=transform,
             image_size=int(cfg.data.image_size),
             mode="train",
             forward_model=forward_model,
             use_forward_model=use_forward_model,
             add_noise=True,
-            noise_level=0.05
+            noise_level=0.05,
+            use_16bit_normalization=bool(getattr(cfg.data, "use_16bit_normalization", True))
         )
         
         val_dataset = UnpairedDataset(
-            wf_dir=str(wf_dir),
-            twop_dir=str(twop_dir),
+            wf_dir=str(val_wf_dir),
+            twop_dir=str(val_twop_dir),
             transform=transform,
             image_size=int(cfg.data.image_size),
             mode="val",
             forward_model=forward_model,
             use_forward_model=use_forward_model,
             add_noise=False,  # No noise during validation
-            noise_level=0.0
+            noise_level=0.0,
+            use_16bit_normalization=bool(getattr(cfg.data, "use_16bit_normalization", True))
         )
         
         if use_paired:
@@ -553,11 +557,13 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         else:
             print("✅ Using true self-supervised learning (forward model generates synthetic WF)")
     else:
-        # Check for unpaired directory structure
-        wf_dir = data_dir / "wf"
-        twop_dir = data_dir / "2p"
+        # Check for unpaired directory structure (fallback)
+        train_wf_dir = data_dir / "train" / "wf"
+        train_twop_dir = data_dir / "train" / "2p"
+        val_wf_dir = data_dir / "val" / "wf"
+        val_twop_dir = data_dir / "val" / "2p"
         
-        if wf_dir.exists() and twop_dir.exists():
+        if all([train_wf_dir.exists(), train_twop_dir.exists(), val_wf_dir.exists(), val_twop_dir.exists()]):
             # Check if we should use forward model for true self-supervised learning
             use_forward_model = bool(getattr(cfg.data, "use_forward_model", True))
             
@@ -567,26 +573,28 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
                 print("✅ Using unpaired self-supervised learning")
                 
             train_dataset = UnpairedDataset(
-                wf_dir=str(wf_dir),
-                twop_dir=str(twop_dir),
+                wf_dir=str(train_wf_dir),
+                twop_dir=str(train_twop_dir),
                 transform=transform,
                 image_size=int(cfg.data.image_size),
                 mode="train",
                 forward_model=forward_model,
                 use_forward_model=use_forward_model,
                 add_noise=True,
-                noise_level=float(getattr(cfg.data, "noise_level", 0.05))
+                noise_level=float(getattr(cfg.data, "noise_level", 0.05)),
+                use_16bit_normalization=bool(getattr(cfg.data, "use_16bit_normalization", True))
             )
             val_dataset = UnpairedDataset(
-                wf_dir=str(wf_dir),
-                twop_dir=str(twop_dir),
+                wf_dir=str(val_wf_dir),
+                twop_dir=str(val_twop_dir),
                 transform=transform,
                 image_size=int(cfg.data.image_size),
                 mode="val",
                 forward_model=forward_model,
                 use_forward_model=use_forward_model,
                 add_noise=False,  # No additional noise for validation
-                noise_level=0.0
+                noise_level=0.0,
+                use_16bit_normalization=bool(getattr(cfg.data, "use_16bit_normalization", True))
             )
         else:
             # Fallback to paired data structure using Hydra instantiation
@@ -710,6 +718,17 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     print(f"Batch size: {cfg.training.batch_size}")
     print(f"Learning rate: {cfg.training.learning_rate}")
 
+    # Cleanup any self-referential or broken last*.ckpt symlinks to avoid IOError
+    try:
+        for p in checkpoint_dir.glob('last*.ckpt'):
+            if p.is_symlink():
+                target = os.readlink(p)
+                # Remove if points to itself or points to a missing file
+                if target == p.name or not (checkpoint_dir / target).exists():
+                    p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     # Use PyTorch Lightning training if available
     if HAS_LIGHTNING:
         print("🚀 Using PyTorch Lightning training with automatic early stopping")
@@ -733,6 +752,43 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
 
         # Setup Lightning callbacks
         callbacks = []
+        
+        class EpochMetricsPrinter(pl.Callback):
+            def __init__(self, file_logger):
+                super().__init__()
+                self._logger = file_logger
+            
+            def on_validation_epoch_end(self, trainer, pl_module):
+                metrics = trainer.callback_metrics
+                
+                def _extract(keys):
+                    for key in keys:
+                        if key in metrics:
+                            val = metrics[key]
+                            try:
+                                return float(val)
+                            except Exception:
+                                return val.item() if hasattr(val, 'item') else val
+                    # Fallback: search for aggregated epoch metrics
+                    for key in metrics.keys():
+                        if 'train/loss' in key and 'epoch' in key:
+                            val = metrics[key]
+                            try:
+                                return float(val)
+                            except Exception:
+                                return val.item() if hasattr(val, 'item') else val
+                    return None
+                
+                train_loss = _extract(['train/loss_epoch', 'train/loss'])
+                val_loss = _extract(['val/loss_epoch', 'val/loss'])
+                if train_loss is not None or val_loss is not None:
+                    msg = (
+                        f"Epoch {trainer.current_epoch + 1} - "
+                        f"Train Loss: {train_loss if train_loss is not None else 'N/A'}, "
+                        f"Val Loss: {val_loss if val_loss is not None else 'N/A'}"
+                    )
+                    print(msg)
+                    self._logger.info(msg)
         
         # Model checkpoint callback - step-based saving (DDPM standard)
         checkpoint_callback = ModelCheckpoint(
@@ -769,6 +825,9 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         )
         callbacks.append(early_stop_callback)
         
+        # Always print end-of-epoch train/val losses
+        callbacks.append(EpochMetricsPrinter(logger))
+        
         # Setup Lightning trainer with performance optimizations
         trainer = pl.Trainer(
             max_epochs=max_epochs,
@@ -780,7 +839,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
             gradient_clip_val=grad_clip_val,
             accumulate_grad_batches=int(cfg.training.get('accumulate_grad_batches', 1)),
             log_every_n_steps=int(cfg.training.get('log_every_n_steps', 100)),
-            val_check_interval=min(int(cfg.training.get('val_check_interval', 500)), 525),  # Validate every 500 steps, max 525 (batches per epoch)
+            val_check_interval=cfg.training.get('val_check_interval', 1.0),  # Validate at end of epoch (1.0) or every N steps
             limit_val_batches=float(cfg.training.get('limit_val_batches', 1.0)),  # Limit validation batches for speed
             enable_progress_bar=True,
             enable_model_summary=False,  # Disable for speed
@@ -796,8 +855,16 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         
         print(f"✅ Lightning training completed!")
         print(f"📁 Checkpoints saved to: {checkpoint_dir}")
-        print(f"🏆 Best model path: {checkpoint_callback.best_model_path}")
-        print(f"🏆 Best model score: {checkpoint_callback.best_model_score:.6f}")
+        best_path = checkpoint_callback.best_model_path or "None"
+        best_score = checkpoint_callback.best_model_score
+        print(f"🏆 Best model path: {best_path}")
+        if best_score is not None:
+            try:
+                print(f"🏆 Best model score: {float(best_score):.6f}")
+            except Exception:
+                print(f"🏆 Best model score: {best_score}")
+        else:
+            print("🏆 Best model score: None")
         
         logger.info(f"Lightning training completed!")
         logger.info(f"Best model path: {checkpoint_callback.best_model_path}")

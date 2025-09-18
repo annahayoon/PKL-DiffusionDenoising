@@ -16,11 +16,12 @@ experiment:
 
 # Path configuration
 paths:
-  root: ${oc.env:PROJECT_ROOT,.}
-  data: ${paths.root}/data/real_microscopy  # Access to 128x128 patch dataset
-  checkpoints: ${paths.root}/checkpoints
-  outputs: ${paths.root}/outputs
-  logs: ${paths.root}/logs
+  code_root: /home/jilab/anna_OS_ML/PKL-DiffusionDenoising
+  data_root: /home/jilab/anna_OS_ML/PKL-DiffusionDenoising
+  data: ${paths.data_root}/data/real_microscopy  # Access to 128x128 patch dataset
+  checkpoints: ${paths.data_root}/checkpoints
+  outputs: ${paths.data_root}/outputs
+  logs: ${paths.data_root}/logs
 
 # Weights & Biases logging
 wandb:
@@ -39,6 +40,7 @@ model:
   up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"]
   class_embed_type: null
   cross_attention_dim: null
+  learned_variance: true
   
   # Multi-Resolution Training Configuration
   multi_resolution:
@@ -75,20 +77,20 @@ training:
   max_epochs: -1                # Disable epoch limit (step-based training)
   num_timesteps: 1000           # Diffusion timesteps (1000 is optimal for quality)
   beta_schedule: cosine         # cosine schedule works better than linear
-  learning_rate: 1.0e-4         # Stable learning rate for diffusion models
+  learning_rate: 7.5e-5         # Slightly lower LR for stability
   weight_decay: 1.0e-6          # L2 regularization
   
-  # Batch and memory settings - MAXIMIZED for A40 (46GB VRAM) + 72 CPU cores
-  batch_size: 64                # INCREASED: Max batch size for A40 with 128x128 images
-  num_workers: 32               # OPTIMIZED: Use 32 workers (72 cores available, leave headroom)
-  accumulate_grad_batches: 2    # REDUCED: Effective batch = 64 * 2 = 128 (same effective size, faster)
+  # Batch and memory settings - SAFE for A40 memory limits
+  batch_size: 48                # REDUCED: Safe batch size to avoid OOM (24GB usage)
+  num_workers: 12               # REDUCED: Optimal for A40 (too many workers cause overhead)
+  accumulate_grad_batches: 2    # ADDED: Effective batch = 48 * 2 = 96 (same effective size)
   gradient_clip: 1.0            # Gradient clipping for stability
   
-  # Memory optimization - MAXIMIZED for A40 (46GB VRAM) + high-core CPU
+  # Memory optimization - OPTIMIZED for A40 throughput
   persistent_workers: true      # Keep workers alive between epochs
-  prefetch_factor: 16           # INCREASED: High prefetch for 72-core CPU (more aggressive)
+  prefetch_factor: 4            # REDUCED: Less memory pressure, still good prefetch
   pin_memory: true              # Pin memory for faster GPU transfer
-  drop_last: false              # Use all data samples
+  drop_last: true               # Drop last incomplete batch for consistent timing
   
   # GPU Memory scaling guide for 128x128 images (proven values):
   # - A40/A100 (40-80GB): batch_size: 32 + accumulate_grad_batches: 3 (current, proven)
@@ -101,6 +103,17 @@ training:
   use_ema: true                 # Exponential moving average for stable inference
   use_conditioning: false       # Disable WF conditioning for pure self-supervised learning
   conditioning_type: none       # No conditioning for grayscale microscopy
+
+  # ELBO (variational bound) settings
+  use_elbo_loss: true
+  combine_elbo_with_simple: true
+  elbo_weight: 1.0
+  elbo_sigma0: 1.0
+  elbo_observation: poisson    # poisson | gaussian
+  elbo_poisson_epsilon: 1e-6
+  learned_variance: true
+  min_logvar: -10.0
+  max_logvar: 2.0
   
   # ADAPTIVE LEARNING RATE SCHEDULING - Optimized for progressive training
   use_scheduler: true           # Enable adaptive learning rate
@@ -130,36 +143,30 @@ training:
           patience: 10
           factor: 0.5
   
-  # EARLY STOPPING - Step-based for 1M step training
-  early_stopping_patience: 50000  # 50K steps patience (equivalent to ~190 epochs)
-  early_stopping_min_delta: 1e-6  # Sensitive to small improvements
+  # VALIDATION AND CHECKPOINTING - Best practices for diffusion training
+  val_check_interval: 1.0      # Validate at end of each epoch (standard practice)
+  log_every_n_steps: 50        # Log training metrics every 50 steps (more frequent)
+  save_every_n_epochs: 5       # Save checkpoint every 5 epochs
+  
+  # PERFORMANCE OPTIMIZATIONS - A40 specific with memory safety
+  precision: "16-mixed"         # Mixed precision for 2x speed boost
+  compile_model: true           # PyTorch 2.0 compilation (15-20% speedup)
+  use_fused_adam: true          # Fused AdamW optimizer
+  benchmark: true               # Enable cuDNN benchmarking
+  
+  # MEMORY MANAGEMENT - Prevent OOM errors
+  gradient_checkpointing: true  # Trade compute for memory (reduces memory usage)
+  max_memory_usage: 0.85        # Use max 85% of GPU memory (safety margin)
+  
+  # EARLY STOPPING - More patient for dual objective training
+  early_stopping_patience: 25     # 25 epochs patience (more reasonable)
+  early_stopping_min_delta: 0.01  # Less sensitive to small fluctuations
   early_stopping_monitor: val_loss  # Metric to monitor
   early_stopping_mode: "min"   # Monitor for minimum loss
   early_stopping_verbose: true # Log early stopping decisions
   
-  # DUAL OBJECTIVE TRAINING - Default enabled for spatial + intensity optimization
-  use_dual_objective_loss: true # Enable dual objective loss (spatial resolution + pixel intensity)
-  
-  # PURE SELF-SUPERVISED dual objective loss configuration
-  dual_objective_loss:
-    # Loss component weights (adaptive during training) - NO SUPERVISED COMPONENTS
-    alpha_diffusion: 1.0        # Weight for diffusion loss (spatial structure)
-    beta_intensity: 0.6         # Weight for intensity mapping loss (pixel accuracy)
-    gamma_perceptual: 0.0       # DISABLED - No supervised VGG features
-    delta_gradient: 0.4         # Weight for gradient loss (edge sharpness)
-    
-    # Loss configurations - All self-supervised
-    intensity_loss_type: "mse"  # mse, l1, smooth_l1
-    gradient_loss_type: "l1"    # l1, l2, smooth_l1
-    intensity_weight_mode: "adaptive"  # adaptive, fixed
-    
-    # Adaptive weighting (gradually increase intensity focus)
-    use_adaptive_weighting: true
-    warmup_steps: 1000          # Steps to reach full intensity weight
-    
-    # NO SUPERVISED PERCEPTUAL LOSS - maintains self-supervised purity
-    use_perceptual_loss: false  # DISABLED - VGG contradicts self-supervised approach
-    perceptual_layers: []       # Empty - no supervised features
+  # DUAL OBJECTIVE TRAINING - disabled to focus on inference-time guidance
+  use_dual_objective_loss: false
   
   # PURE SELF-SUPERVISED LEARNING - No supervised components
   supervised_x0_weight: 0.0     # DISABLED - Pure self-supervised learning
@@ -169,10 +176,7 @@ training:
   cycle_loss_type: smooth_l1    # smooth_l1, l1, or l2 (smooth_l1 is more robust)
   use_perceptual_loss: false    # DISABLED - Maintains self-supervised purity
   
-  # STEP-BASED validation and checkpointing
-  val_check_interval: 500       # Validate every 500 steps (must be ≤ 525 batches per epoch)
-  save_every_n_steps: 10000     # Save checkpoint every 10000 steps
-  log_every_n_steps: 100        # Log metrics every 100 steps
+  # NOTE: Validation and logging settings moved to top of training section
   
   # COMPREHENSIVE MODEL SAVING STRATEGY
   checkpoint_every_n_steps: [5000, 10000]  # Multiple checkpoint intervals
@@ -204,10 +208,7 @@ training:
   steps_per_epoch: 263          # Corrected: 33,635 samples ÷ 128 effective batch size = 263 steps/epoch
   
   # PERFORMANCE OPTIMIZATIONS - Maximize A40 utilization
-  compile_model: true           # PyTorch 2.0 compilation for 15-20% speedup
-  use_fused_adam: true          # Fused AdamW optimizer for speed
   dataloader_pin_memory_device: "cuda"  # Pin directly to GPU
-  precision: 16-mixed           # Mixed precision training
   
 # Data configuration - 128x128 patches with 16-bit support
 data:
@@ -308,7 +309,6 @@ logging:
   
 # Memory and performance optimization - MAXIMIZED for A40
 optimization:
-  compile_model: true           # PyTorch 2.0 model compilation (15-20% speedup)
   channels_last: true           # Use channels last memory format (better A40 performance)
   benchmark_cudnn: true         # Enable cuDNN benchmarking
   deterministic: false          # Non-deterministic for maximum speed

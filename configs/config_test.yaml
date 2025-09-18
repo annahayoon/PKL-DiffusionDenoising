@@ -1,0 +1,226 @@
+defaults:
+  - model: unet
+  - data: real_pairs
+  - physics: microscopy
+  - guidance: pkl
+  - training: ddpm
+  - override hydra/launcher: basic
+  - _self_
+
+# Experiment configuration (quick test)
+experiment:
+  name: microscopy_test_${now:%Y-%m-%d_%H-%M-%S}
+  seed: 42
+  device: cuda
+  mixed_precision: true
+
+# Paths
+paths:
+  code_root: /global/home/users/anna_yoon/PKL-DiffusionDenoising
+  data_root: /global/scratch/users/anna_yoon
+  data: ${paths.data_root}/data
+  checkpoints: ${paths.data_root}/checkpoints
+  outputs: ${paths.data_root}/outputs
+  logs: ${paths.data_root}/logs
+
+# Wandb logging (disable for quick tests)
+wandb:
+  project: pkl-diffusion-microscopy
+  entity: anna_yoon-uc-berkeley
+  mode: disabled
+
+# Model configuration
+model:
+  sample_size: 128
+  in_channels: 1
+  out_channels: 1
+  layers_per_block: 2
+  block_out_channels: [96, 192, 384, 384]
+  down_block_types: ["DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
+  up_block_types:   ["AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"]
+  class_embed_type: null
+  cross_attention_dim: null
+  learned_variance: true
+
+# Training configuration (smaller for fast iteration)
+training:
+  # Use small epoch/step budget
+  max_steps: 1000
+  max_epochs: 10
+  num_timesteps: 1000
+  beta_schedule: cosine
+  learning_rate: 7.5e-5
+  weight_decay: 1.0e-6
+
+  # Smaller batches/workers
+  batch_size: 16
+  num_workers: 4
+  accumulate_grad_batches: 1
+  gradient_clip: 1.0
+
+  # Dataloader/memory
+  persistent_workers: true
+  prefetch_factor: 2
+  pin_memory: true
+  drop_last: true
+
+  # Features
+  use_ema: true
+  use_conditioning: false
+  conditioning_type: none
+
+  # ELBO (variational bound) — enable hybrid objective (Nichol & Dhariwal 2021)
+  use_elbo_loss: true
+  combine_elbo_with_simple: true
+  elbo_weight: 1.0
+  elbo_sigma0: 1.0
+  elbo_observation: poisson
+  elbo_poisson_epsilon: 1e-6
+  learned_variance: true
+  min_logvar: -10.0
+  max_logvar: 2.0
+
+  # Scheduler (keep simple, small warmup)
+  use_scheduler: true
+  scheduler_type: "improved_cosine"
+  scheduler_warmup_steps: 200
+
+  # Advanced scheduler manager with alternatives (includes ReduceLROnPlateau)
+  advanced_schedulers:
+    enabled: true
+    primary_scheduler: "improved_cosine"
+    scheduler_params:
+      T_max: 200
+      eta_min: 1e-6
+      T_mult: 2
+      restart_decay: 0.8
+    alternatives:
+      - name: "plateau"
+        type: "adaptive"
+        params:
+          patience: 3
+          factor: 0.5
+          threshold: 1e-4
+          cooldown: 0
+          min_lr: 1e-8
+          mode: "min"
+
+  # Validation/logging (more frequent for tests)
+  val_check_interval: 1.0
+  log_every_n_steps: 10
+  save_every_n_epochs: 1
+  limit_val_batches: 1.0
+
+  # Perf (disable compile to reduce startup time in test runs)
+  precision: "16-mixed"
+  compile_model: false
+  use_fused_adam: true
+  benchmark: true
+
+  # Memory safety
+  gradient_checkpointing: true
+  max_memory_usage: 0.85
+
+  # Early stopping (not strict for short tests)
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.01
+  early_stopping_monitor: val_loss
+  early_stopping_mode: "min"
+  early_stopping_verbose: true
+
+  # Dual objective loss — removed to focus on hybrid DDPM objective
+  use_dual_objective_loss: false
+
+  supervised_x0_weight: 0.0
+  ddpm_loss_weight: 1.0
+  cycle_loss_weight: 0.15
+  perceptual_loss_weight: 0.0
+  cycle_loss_type: smooth_l1
+  use_perceptual_loss: false
+
+  # Advanced options
+  steps_per_epoch: 100
+  dataloader_pin_memory_device: "cuda"
+
+# Data
+data:
+  image_size: 128
+  min_intensity: 0
+  max_intensity: 65535
+  noise_model: poisson
+  use_16bit_normalization: true
+  align_pairs: true
+  use_self_supervised: true
+  use_zarr: false
+  data_loading:
+    use_zarr: false
+    cache_dataset: true
+
+# PSF/Physics
+psf:
+  type: gaussian
+  sigma_x: 2.0
+  sigma_y: 2.0
+  size: 21
+  background: 0.0
+
+physics:
+  use_psf: true
+  use_bead_psf: true
+  beads_dir: ${paths.data}/beads
+  bead_mode: with_AO
+  psf_type: measured
+  background: 0.0
+  noise_type: poisson
+
+# Guidance
+guidance:
+  type: pkl
+  epsilon: 1e-6
+  schedule_type: adaptive
+  lambda_base: 0.1
+  schedule:
+    T_threshold: 800
+    epsilon_lambda: 1e-3
+
+# Evaluation/visualization for tests
+evaluation:
+  metrics: ["psnr", "ssim", "frc"]
+  save_samples: true
+  num_samples: 4
+  eval_every_n_epochs: 1
+
+# Inference (faster for tests)
+inference:
+  ddim_steps: 25
+  eta: 0.0
+  use_autocast: true
+  batch_size: 2
+  guidance_scale: 1.0
+
+# Hardware
+hardware:
+  devices: 1
+  accelerator: gpu
+  strategy: auto
+  sync_batchnorm: false
+
+# Logging
+logging:
+  log_level: INFO
+  log_every_n_steps: 10
+  save_top_k: 1
+  monitor_metric: val_loss
+
+# Optimization flags
+optimization:
+  channels_last: true
+  benchmark_cudnn: true
+  deterministic: false
+  memory_efficient_attention: true
+  gradient_checkpointing: true
+  use_gradient_checkpointing: true
+  use_tf32: true
+  torch_compile_mode: "default"
+
+

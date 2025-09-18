@@ -161,6 +161,10 @@ class UNet(nn.Module):
         # Output projection - zero-initialized conv for diffusion
         self.conv_norm_out = get_normalization("groupnorm", self.block_out_channels[0])
         self.conv_out = ZeroConv2d(self.block_out_channels[0], self.out_channels, 3, padding=1)
+        # Optional learned variance head (Improved DDPM)
+        self.predict_variance = bool(config.get("learned_variance", False))
+        if self.predict_variance:
+            self.conv_out_var = ZeroConv2d(self.block_out_channels[0], self.out_channels, 3, padding=1)
         
         # Memory optimization settings
         self.gradient_checkpointing = config.get("gradient_checkpointing", False)
@@ -335,10 +339,16 @@ class UNet(nn.Module):
         # Output
         h = self.conv_norm_out(h)
         h = F.silu(h)
-        h = self.conv_out(h)
+        eps_out = self.conv_out(h)
+        if self.predict_variance:
+            var_out = self.conv_out_var(h)
         
         # Denormalize output back to 16-bit range if requested
         if denormalize_output:
-            h = self.denormalize_output(h)
+            eps_out = self.denormalize_output(eps_out)
+            if self.predict_variance:
+                var_out = self.denormalize_output(var_out)
         
-        return h
+        if self.predict_variance:
+            return eps_out, var_out
+        return eps_out

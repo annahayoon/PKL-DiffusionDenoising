@@ -19,11 +19,12 @@ experiment:
 
 # Path configuration - HPC optimized paths
 paths:
-  root: ${oc.env:PROJECT_ROOT,.}
-  data: ${paths.root}/data/real_microscopy  # Access to 128x128 patch dataset
-  checkpoints: ${paths.root}/checkpoints
-  outputs: ${paths.root}/outputs
-  logs: ${paths.root}/logs
+  code_root: /global/home/users/anna_yoon/PKL-DiffusionDenoising
+  data_root: /global/scratch/users/anna_yoon
+  data: ${paths.data_root}/data/real_microscopy  # Access to 128x128 patch dataset
+  checkpoints: ${paths.data_root}/checkpoints
+  outputs: ${paths.data_root}/outputs
+  logs: ${paths.data_root}/logs
 
 # Weights & Biases logging
 wandb:
@@ -42,6 +43,7 @@ model:
   up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"]
   class_embed_type: null
   cross_attention_dim: null
+  learned_variance: true
   
   # Multi-Resolution Training Configuration
   multi_resolution:
@@ -98,6 +100,17 @@ training:
   use_conditioning: false
   conditioning_type: none
   
+  # ELBO (variational bound) hybrid objective (Nichol & Dhariwal 2021)
+  use_elbo_loss: true
+  combine_elbo_with_simple: true
+  elbo_weight: 1.0
+  elbo_sigma0: 1.0
+  elbo_observation: poisson
+  elbo_poisson_epsilon: 1e-6
+  learned_variance: true
+  min_logvar: -10.0
+  max_logvar: 2.0
+  
   # ADAPTIVE LEARNING RATE SCHEDULING - Optimized for progressive training
   use_scheduler: true
   scheduler_type: "improved_cosine"  # Advanced cosine with restarts
@@ -120,28 +133,8 @@ training:
   early_stopping_mode: "min"
   early_stopping_verbose: true
   
-  # DUAL OBJECTIVE TRAINING - Default enabled for spatial + intensity optimization
-  use_dual_objective_loss: true # Enable dual objective loss (spatial resolution + pixel intensity)
-  
-  # Dual objective loss configuration
-  dual_objective_loss:
-    # Loss component weights (adaptive during training)
-    alpha_diffusion: 1.0        # Weight for diffusion loss (spatial structure)
-    beta_intensity: 0.6         # Weight for intensity mapping loss (pixel accuracy)
-    delta_gradient: 0.4         # Weight for gradient loss (edge sharpness)
-    
-    # Loss configurations - Pure self-supervised
-    intensity_loss_type: "mse"  # mse, l1, smooth_l1
-    gradient_loss_type: "l1"    # l1, l2, smooth_l1
-    intensity_weight_mode: "adaptive"  # adaptive, fixed
-    
-    # Adaptive weighting (gradually increase intensity focus)
-    use_adaptive_weighting: true
-    warmup_steps: 1000          # Steps to reach full intensity weight
-    
-    # NO SUPERVISED PERCEPTUAL LOSS
-    use_perceptual_loss: false  # DISABLED - Pure self-supervised approach
-    perceptual_layers: ["relu2_2", "relu3_3", "relu4_3"]
+  # DUAL OBJECTIVE TRAINING - disabled to focus on hybrid DDPM objective and inference-time guidance
+  use_dual_objective_loss: false
   
   # Legacy parameters (kept for compatibility)
   supervised_x0_weight: 0.0

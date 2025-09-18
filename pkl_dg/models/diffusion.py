@@ -120,6 +120,18 @@ class DDPMTrainer(LightningModuleBase):
         # Mixed precision training setup
         self.mixed_precision = config.get("mixed_precision", False)
         self.autocast_dtype = self._get_optimal_dtype()
+
+        # ELBO/VLB configuration
+        self.use_elbo_loss = bool(config.get("use_elbo_loss", True))
+        self.combine_elbo_with_simple = bool(config.get("combine_elbo_with_simple", True))
+        self.elbo_weight = float(config.get("elbo_weight", 1.0))
+        self.elbo_sigma0 = float(config.get("elbo_sigma0", 1.0))
+        self.elbo_observation = str(config.get("elbo_observation", "poisson")).lower()
+        self.elbo_poisson_epsilon = float(config.get("elbo_poisson_epsilon", 1e-6))
+        # Learned variance (Improved DDPM)
+        self.learned_variance = bool(config.get("learned_variance", False))
+        self.min_logvar = float(config.get("min_logvar", -20.0))
+        self.max_logvar = float(config.get("max_logvar", 2.0))
         
         # Enable memory-efficient attention on newer GPUs
         if torch.cuda.is_available():
@@ -508,6 +520,75 @@ class DDPMTrainer(LightningModuleBase):
         )
         return model_mean, posterior_variance, posterior_log_variance
 
+    def _compute_elbo_term(
+        self,
+        x_0: torch.Tensor,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        noise_pred: torch.Tensor,
+        var_pred: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute a single-sample variational bound term for the sampled t.
+
+        Uses matching variance for q and p (posterior_variance) so KL reduces to
+        a mean-squared difference between posterior means scaled by variance.
+
+        For t == 0, uses an x0 reconstruction NLL term with fixed variance elbo_sigma0^2.
+        """
+        # Recover x0_hat from predicted noise
+        alpha_t_b = self._extract(self.alphas_cumprod, t, x_t.shape)
+        sqrt_alpha_t = torch.sqrt(alpha_t_b + 1e-8)
+        sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t_b + 1e-8)
+        x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+        x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
+
+        # Masks for t==0 and t>0
+        t_is_zero = (t == 0).view(-1, *([1] * (x_t.ndim - 1)))
+        t_gt_zero = ~t_is_zero
+
+        # Initialize loss tensor
+        vlb = torch.zeros_like(x_t)
+
+        # t > 0: KL between q(x_{t-1}|x_t, x0) and p_theta(x_{t-1}|x_t)
+        if t_gt_zero.any():
+            # True posterior mean given GT x0
+            mu_q, var_q, _ = self.q_posterior(x_start=x_0, x_t=x_t, t=t)
+            # Model mean using predicted x0_hat
+            mu_theta, _, _ = self.q_posterior(x_start=x0_hat, x_t=x_t, t=t)
+            # Use learned variance if provided, else match q variance
+            if (var_pred is not None) and self.learned_variance:
+                log_var_theta = torch.clamp(var_pred, self.min_logvar, self.max_logvar)
+                var_theta = torch.exp(log_var_theta)
+            else:
+                var_theta = var_q
+            # KL(q||p) for diagonal Gaussians
+            kl = 0.5 * (
+                torch.log((var_theta + 1e-12) / (var_q + 1e-12))
+                + (var_q + (mu_q - mu_theta) ** 2) / (var_theta + 1e-12)
+                - 1.0
+            )
+            vlb = torch.where(t_gt_zero, kl, vlb)
+
+        # t == 0: Observation NLL term (Gaussian or Poisson)
+        if t_is_zero.any():
+            if self.elbo_observation == "poisson":
+                # Map model domain [-1,1] -> intensity domain (non-negative)
+                x0_hat_int = torch.clamp(self._model_to_intensity(x0_hat, self.transform), min=0)
+                x0_int = torch.clamp(self._model_to_intensity(x_0, self.transform), min=0)
+                eps = self.elbo_poisson_epsilon
+                # Poisson NLL (up to constant): lambda_hat - y * log(lambda_hat)
+                nll0 = x0_hat_int - x0_int * torch.log(x0_hat_int + eps)
+            else:
+                # Gaussian NLL on x0 (fixed variance)
+                sigma0_sq = max(self.elbo_sigma0 ** 2, 1e-6)
+                nll0 = 0.5 * ((x0_hat - x_0) ** 2) / sigma0_sq
+            vlb = torch.where(t_is_zero, nll0, vlb)
+
+        # Mean over channels and spatial dims, then average batch
+        while vlb.ndim > 1:
+            vlb = vlb.mean(dim=-1)
+        return vlb.mean()
+
     @torch.no_grad()
     def p_sample(self, pred_noise: torch.Tensor, x: torch.Tensor, t: torch.Tensor, clip_denoised: bool = True) -> torch.Tensor:
         model_mean, _, model_log_variance = self.p_mean_variance(
@@ -617,7 +698,17 @@ class DDPMTrainer(LightningModuleBase):
         x_0, c_wf = batch
         b = x_0.shape[0]
         device = x_0.device
-        t = torch.randint(0, self.num_timesteps, (b,), device=device)
+        # Timestep curriculum: reduce max_t early to stabilize training
+        if hasattr(self, 'global_step'):
+            warmup_steps = int(self.config.get('dual_objective_loss', {}).get('warmup_steps', 1000))
+            # Use a conservative cap on timesteps during warmup (e.g., 40% of range)
+            if self.global_step < warmup_steps:
+                max_t = max(1, int(0.4 * self.num_timesteps))
+                t = torch.randint(0, max_t, (b,), device=device)
+            else:
+                t = torch.randint(0, self.num_timesteps, (b,), device=device)
+        else:
+            t = torch.randint(0, self.num_timesteps, (b,), device=device)
         noise = torch.randn_like(x_0)
         x_t = self.q_sample(x_0, t, noise)
         
@@ -634,19 +725,37 @@ class DDPMTrainer(LightningModuleBase):
                 else:
                     noise_pred = self.model(x_t, t)
                 
-                # Standard diffusion loss (noise prediction)
-                diffusion_loss = F.mse_loss(noise_pred, noise)
+                # Support learned variance head: model may return (eps, logvar)
+                if isinstance(noise_pred, tuple):
+                    eps_pred, var_pred = noise_pred
+                else:
+                    eps_pred, var_pred = noise_pred, None
+                # Standard diffusion loss on epsilon
+                diffusion_loss = F.mse_loss(eps_pred, noise)
                 
                 # Reconstruct x0 for dual objective loss
                 alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
                 sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
                 sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
-                x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                x0_hat = (x_t - sqrt_one_minus_alpha_t * eps_pred) / sqrt_alpha_t
                 
+                # Compute ELBO/VLB term if enabled
+                if self.use_elbo_loss:
+                    vlb_term = self._compute_elbo_term(x_0=x_0, x_t=x_t, t=t, noise_pred=eps_pred, var_pred=var_pred)
+                    self._log_if_trainer("train/vlb", vlb_term)
+                else:
+                    vlb_term = None
+
+                # Combine base diffusion loss with ELBO if configured
+                if self.combine_elbo_with_simple and vlb_term is not None:
+                    base_loss = diffusion_loss + self.elbo_weight * vlb_term
+                else:
+                    base_loss = diffusion_loss
+
                 # Apply dual objective loss if enabled
                 if self.use_dual_objective_loss:
                     loss_components = self.dual_objective_loss(
-                        diffusion_loss=diffusion_loss,
+                        diffusion_loss=base_loss,
                         pred_x0=x0_hat,
                         target_x0=x_0,
                         step=self.global_step
@@ -659,7 +768,7 @@ class DDPMTrainer(LightningModuleBase):
                     self._log_if_trainer("train/gradient_loss", loss_components['gradient_loss'])
                     
                 else:
-                    loss = diffusion_loss
+                    loss = base_loss
                     
                     # Optional supervised x0 loss to encourage paired mapping
                     if self.config.get("supervised_x0_weight", 0.0) > 0:
@@ -677,18 +786,35 @@ class DDPMTrainer(LightningModuleBase):
                 noise_pred = self.model(x_t, t)
             
             # Standard diffusion loss (noise prediction)
-            diffusion_loss = F.mse_loss(noise_pred, noise)
+            if isinstance(noise_pred, tuple):
+                eps_pred, var_pred = noise_pred
+            else:
+                eps_pred, var_pred = noise_pred, None
+            diffusion_loss = F.mse_loss(eps_pred, noise)
             
             # Reconstruct x0 for dual objective loss
             alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
             sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
             sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
-            x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+            x0_hat = (x_t - sqrt_one_minus_alpha_t * eps_pred) / sqrt_alpha_t
             
+            # ELBO term
+            if self.use_elbo_loss:
+                vlb_term = self._compute_elbo_term(x_0=x_0, x_t=x_t, t=t, noise_pred=eps_pred, var_pred=var_pred)
+                self._log_if_trainer("train/vlb", vlb_term)
+            else:
+                vlb_term = None
+
+            # Combine base loss
+            if self.combine_elbo_with_simple and vlb_term is not None:
+                base_loss = diffusion_loss + self.elbo_weight * vlb_term
+            else:
+                base_loss = diffusion_loss
+
             # Apply dual objective loss if enabled
             if self.use_dual_objective_loss:
                 loss_components = self.dual_objective_loss(
-                    diffusion_loss=diffusion_loss,
+                    diffusion_loss=base_loss,
                     pred_x0=x0_hat,
                     target_x0=x_0,
                     step=self.global_step
@@ -701,7 +827,7 @@ class DDPMTrainer(LightningModuleBase):
                 self._log_if_trainer("train/gradient_loss", loss_components['gradient_loss'])
                 
             else:
-                loss = diffusion_loss
+                loss = base_loss
                 
                 # Optional supervised x0 loss to encourage paired mapping
                 if self.config.get("supervised_x0_weight", 0.0) > 0:
@@ -729,7 +855,7 @@ class DDPMTrainer(LightningModuleBase):
             # Log advanced feature metrics
             self._log_advanced_metrics(batch_idx, loss)
         
-        self._log_if_trainer("train/loss", loss, prog_bar=True)
+        self._log_if_trainer("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         if self.use_ema and self.global_step % 10 == 0:
             self._update_ema()
         # advance step counter in fallback environments
@@ -788,7 +914,11 @@ class DDPMTrainer(LightningModuleBase):
                         noise_pred = self.model(x_t, t)
                     
                     # Compute diffusion loss
-                    diffusion_loss = F.mse_loss(noise_pred, noise)
+                    if isinstance(noise_pred, tuple):
+                        eps_pred, _ = noise_pred
+                    else:
+                        eps_pred = noise_pred
+                    diffusion_loss = F.mse_loss(eps_pred, noise)
                     
                     # Use dual objective loss if enabled (same as training)
                     if self.use_dual_objective_loss and self.dual_objective_loss is not None:
@@ -796,7 +926,7 @@ class DDPMTrainer(LightningModuleBase):
                         alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
                         sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
                         sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
-                        x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                        x0_hat = (x_t - sqrt_one_minus_alpha_t * eps_pred) / sqrt_alpha_t
                         
                         # Apply dual objective loss
                         loss_components = self.dual_objective_loss(
@@ -805,10 +935,23 @@ class DDPMTrainer(LightningModuleBase):
                             target_x0=x_0,
                             step=self.global_step
                         )
-                        losses.append(loss_components['total_loss'])
+                        # Optional ELBO for validation logging
+                        if self.use_elbo_loss:
+                            vlb_term = self._compute_elbo_term(x_0=x_0, x_t=x_t, t=t, noise_pred=eps_pred)
+                            self._log_if_trainer("val/vlb", vlb_term)
+                            total = loss_components['total_loss'] + (self.elbo_weight * vlb_term if self.combine_elbo_with_simple else 0.0)
+                            losses.append(total)
+                        else:
+                            losses.append(loss_components['total_loss'])
                     else:
                         # Standard diffusion loss only
-                        losses.append(diffusion_loss)
+                        if self.use_elbo_loss:
+                            vlb_term = self._compute_elbo_term(x_0=x_0, x_t=x_t, t=t, noise_pred=eps_pred)
+                            self._log_if_trainer("val/vlb", vlb_term)
+                            total = diffusion_loss + (self.elbo_weight * vlb_term if self.combine_elbo_with_simple else 0.0)
+                            losses.append(total)
+                        else:
+                            losses.append(diffusion_loss)
             else:
                 # Standard precision validation
                 if use_conditioning:
@@ -820,7 +963,11 @@ class DDPMTrainer(LightningModuleBase):
                     noise_pred = self.model(x_t, t)
                 
                 # Compute diffusion loss
-                diffusion_loss = F.mse_loss(noise_pred, noise)
+                if isinstance(noise_pred, tuple):
+                    eps_pred, _ = noise_pred
+                else:
+                    eps_pred = noise_pred
+                diffusion_loss = F.mse_loss(eps_pred, noise)
                 
                 # Use dual objective loss if enabled (same as training)
                 if self.use_dual_objective_loss and self.dual_objective_loss is not None:
@@ -828,7 +975,7 @@ class DDPMTrainer(LightningModuleBase):
                     alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
                     sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
                     sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
-                    x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                    x0_hat = (x_t - sqrt_one_minus_alpha_t * eps_pred) / sqrt_alpha_t
                     
                     # Apply dual objective loss
                     loss_components = self.dual_objective_loss(
@@ -837,13 +984,25 @@ class DDPMTrainer(LightningModuleBase):
                         target_x0=x_0,
                         step=self.global_step
                     )
-                    losses.append(loss_components['total_loss'])
+                    if self.use_elbo_loss:
+                        vlb_term = self._compute_elbo_term(x_0=x_0, x_t=x_t, t=t, noise_pred=eps_pred)
+                        self._log_if_trainer("val/vlb", vlb_term)
+                        total = loss_components['total_loss'] + (self.elbo_weight * vlb_term if self.combine_elbo_with_simple else 0.0)
+                        losses.append(total)
+                    else:
+                        losses.append(loss_components['total_loss'])
                 else:
                     # Standard diffusion loss only
-                    losses.append(diffusion_loss)
+                    if self.use_elbo_loss:
+                        vlb_term = self._compute_elbo_term(x_0=x_0, x_t=x_t, t=t, noise_pred=eps_pred)
+                        self._log_if_trainer("val/vlb", vlb_term)
+                        total = diffusion_loss + (self.elbo_weight * vlb_term if self.combine_elbo_with_simple else 0.0)
+                        losses.append(total)
+                    else:
+                        losses.append(diffusion_loss)
                 
         avg_loss = torch.stack(losses).mean()
-        self._log_if_trainer("val/loss", avg_loss, prog_bar=True)
+        self._log_if_trainer("val/loss", avg_loss, prog_bar=True, on_step=False, on_epoch=True)
         return avg_loss
 
     def configure_optimizers(self):
@@ -853,11 +1012,75 @@ class DDPMTrainer(LightningModuleBase):
             betas=(0.9, 0.999),
             weight_decay=self.config.get("weight_decay", 1e-6),
         )
-        if self.config.get("use_scheduler", True):
+
+        sched_configs = self.config.get("advanced_schedulers", {})
+        use_advanced = bool(sched_configs.get("enabled", False))
+        schedulers = []
+
+        if use_advanced:
+            primary_name = str(sched_configs.get("primary_scheduler", "improved_cosine")).lower()
+            params = sched_configs.get("scheduler_params", {})
+
+            # Primary scheduler
+            if primary_name in ("improved_cosine", "cosine_restarts"):
+                # Cosine with warm restarts
+                T_0 = int(params.get("T_0", params.get("T_max", 50)))
+                T_mult = int(params.get("T_mult", 2))
+                eta_min = float(params.get("eta_min", 1e-6))
+                sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
+                )
+                schedulers.append({"scheduler": sched, "interval": "epoch"})
+            elif primary_name in ("cosine",):
+                T_max = int(params.get("T_max", self.config.get("max_epochs", 100)))
+                eta_min = float(params.get("eta_min", 1e-6))
+                sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=eta_min)
+                schedulers.append({"scheduler": sched, "interval": "epoch"})
+            elif primary_name in ("exponential",):
+                gamma = float(params.get("decay_rate", 0.96))
+                sched = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+                schedulers.append({"scheduler": sched, "interval": "epoch"})
+
+            # Alternatives
+            for alt in sched_configs.get("alternatives", []):
+                alt_type = str(alt.get("type", "")).lower()
+                alt_params = alt.get("params", {})
+                if alt_type == "adaptive":
+                    # ReduceLROnPlateau
+                    patience = int(alt_params.get("patience", 10))
+                    factor = float(alt_params.get("factor", 0.5))
+                    min_lr = float(alt_params.get("min_lr", 1e-8))
+                    mode = str(alt_params.get("mode", "min"))
+                    cooldown = int(alt_params.get("cooldown", 0))
+                    thresh = float(alt_params.get("threshold", 1e-4))
+                    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        optimizer,
+                        mode=mode,
+                        factor=factor,
+                        patience=patience,
+                        threshold=thresh,
+                        cooldown=cooldown,
+                        min_lr=min_lr,
+                    )
+                    schedulers.append({
+                        "scheduler": sched,
+                        "monitor": "val/loss",
+                        "interval": "epoch",
+                        "reduce_on_plateau": True,
+                    })
+                elif alt_type == "exponential":
+                    gamma = float(alt_params.get("decay_rate", 0.96))
+                    sched = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+                    schedulers.append({"scheduler": sched, "interval": "epoch"})
+
+        elif self.config.get("use_scheduler", True):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=self.config.get("max_epochs", 100), eta_min=1e-6
             )
-            return [optimizer], [scheduler]
+            schedulers.append(scheduler)
+
+        if schedulers:
+            return [optimizer], schedulers
         return optimizer
     
     # ===== Enhanced sampling methods using diffusers schedulers =====

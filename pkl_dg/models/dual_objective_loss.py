@@ -74,7 +74,9 @@ class IntensityMappingLoss(nn.Module):
         self, 
         loss_type: str = "mse",
         intensity_weight_mode: str = "uniform",
-        focus_range: Optional[Tuple[float, float]] = None
+        focus_range: Optional[Tuple[float, float]] = None,
+        nll_sigma: Optional[float] = None,
+        nll_scale: Optional[float] = None,
     ):
         """
         Args:
@@ -89,6 +91,10 @@ class IntensityMappingLoss(nn.Module):
         self.loss_type = loss_type
         self.intensity_weight_mode = intensity_weight_mode
         self.focus_range = focus_range
+        # Parameters for NLL variants (fixed variance/scale)
+        # gaussian_nll uses sigma (std); laplace_nll uses scale b
+        self.nll_sigma = nll_sigma if (nll_sigma is not None) else 0.1
+        self.nll_scale = nll_scale if (nll_scale is not None) else 0.1
         
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -109,6 +115,16 @@ class IntensityMappingLoss(nn.Module):
                 return F.l1_loss(pred, target)
             elif self.loss_type == "smooth_l1":
                 return F.smooth_l1_loss(pred, target)
+            elif self.loss_type == "gaussian_nll":
+                # 0.5[(x-μ)^2/σ^2 + log σ^2]
+                sigma2 = max(self.nll_sigma ** 2, 1e-6)
+                point = 0.5 * ((pred - target) ** 2 / sigma2 + float(torch.log(torch.tensor(sigma2))))
+                return point.mean()
+            elif self.loss_type == "laplace_nll":
+                # |x-μ|/b + log(2b)
+                b = max(self.nll_scale, 1e-6)
+                point = torch.abs(pred - target) / b + float(torch.log(torch.tensor(2.0 * b)))
+                return point.mean()
             
         elif self.intensity_weight_mode == "adaptive":
             # Weight inversely proportional to intensity frequency
@@ -118,8 +134,16 @@ class IntensityMappingLoss(nn.Module):
                 pointwise_loss = diff ** 2
             elif self.loss_type == "l1":
                 pointwise_loss = torch.abs(diff)
-            else:  # smooth_l1
+            elif self.loss_type == "smooth_l1":
                 pointwise_loss = F.smooth_l1_loss(pred, target, reduction='none')
+            elif self.loss_type == "gaussian_nll":
+                sigma2 = max(self.nll_sigma ** 2, 1e-6)
+                pointwise_loss = 0.5 * ((diff ** 2) / sigma2 + float(torch.log(torch.tensor(sigma2))))
+            elif self.loss_type == "laplace_nll":
+                b = max(self.nll_scale, 1e-6)
+                pointwise_loss = torch.abs(diff) / b + float(torch.log(torch.tensor(2.0 * b)))
+            else:
+                pointwise_loss = diff ** 2
             
             # Adaptive weighting based on target intensity rarity
             # For 2P data, lower intensities are more common, so weight higher intensities more
@@ -132,15 +156,29 @@ class IntensityMappingLoss(nn.Module):
             min_val, max_val = self.focus_range
             mask = (target >= min_val) & (target <= max_val)
             
-            if self.loss_type == "mse":
-                loss_focused = F.mse_loss(pred[mask], target[mask]) if mask.any() else 0.0
-                loss_general = F.mse_loss(pred[~mask], target[~mask]) if (~mask).any() else 0.0
-            elif self.loss_type == "l1":
-                loss_focused = F.l1_loss(pred[mask], target[mask]) if mask.any() else 0.0
-                loss_general = F.l1_loss(pred[~mask], target[~mask]) if (~mask).any() else 0.0
-            else:  # smooth_l1
-                loss_focused = F.smooth_l1_loss(pred[mask], target[mask]) if mask.any() else 0.0
-                loss_general = F.smooth_l1_loss(pred[~mask], target[~mask]) if (~mask).any() else 0.0
+            if self.loss_type in ("mse", "l1", "smooth_l1"):
+                if self.loss_type == "mse":
+                    loss_focused = F.mse_loss(pred[mask], target[mask]) if mask.any() else 0.0
+                    loss_general = F.mse_loss(pred[~mask], target[~mask]) if (~mask).any() else 0.0
+                elif self.loss_type == "l1":
+                    loss_focused = F.l1_loss(pred[mask], target[mask]) if mask.any() else 0.0
+                    loss_general = F.l1_loss(pred[~mask], target[~mask]) if (~mask).any() else 0.0
+                else:  # smooth_l1
+                    loss_focused = F.smooth_l1_loss(pred[mask], target[mask]) if mask.any() else 0.0
+                    loss_general = F.smooth_l1_loss(pred[~mask], target[~mask]) if (~mask).any() else 0.0
+            elif self.loss_type == "gaussian_nll":
+                sigma2 = max(self.nll_sigma ** 2, 1e-6)
+                def g_nll(a,b):
+                    return 0.5 * (((a-b) ** 2).mean() / sigma2 + float(torch.log(torch.tensor(sigma2))))
+                loss_focused = g_nll(pred[mask], target[mask]) if mask.any() else 0.0
+                loss_general = g_nll(pred[~mask], target[~mask]) if (~mask).any() else 0.0
+            elif self.loss_type == "laplace_nll":
+                b = max(self.nll_scale, 1e-6)
+                def l_nll(a,b_t):
+                    diff = torch.abs(a-b_t)
+                    return (diff.mean() / b) + float(torch.log(torch.tensor(2.0 * b)))
+                loss_focused = l_nll(pred[mask], target[mask]) if mask.any() else 0.0
+                loss_general = l_nll(pred[~mask], target[~mask]) if (~mask).any() else 0.0
             
             # Weight focused region more heavily
             return 2.0 * loss_focused + 0.5 * loss_general
@@ -170,6 +208,10 @@ class DualObjectiveLoss(nn.Module):
         intensity_loss_type: str = "mse",
         gradient_loss_type: str = "l1",
         intensity_weight_mode: str = "adaptive",
+        
+        # NLL parameters (fixed-variance/scale)
+        nll_sigma: Optional[float] = None,
+        nll_scale: Optional[float] = None,
         
         # Adaptive weighting
         use_adaptive_weighting: bool = True,
@@ -201,7 +243,9 @@ class DualObjectiveLoss(nn.Module):
         # Initialize loss components
         self.intensity_loss = IntensityMappingLoss(
             loss_type=intensity_loss_type,
-            intensity_weight_mode=intensity_weight_mode
+            intensity_weight_mode=intensity_weight_mode,
+            nll_sigma=nll_sigma,
+            nll_scale=nll_scale,
         )
         
         self.gradient_loss = GradientLoss(loss_type=gradient_loss_type)
@@ -254,10 +298,13 @@ class DualObjectiveLoss(nn.Module):
         loss_diffusion = diffusion_loss
         
         # 2. Intensity mapping loss (pixel-wise accuracy)
-        loss_intensity = self.intensity_loss(pred_x0, target_x0)
+        # Clamp inputs to valid model range to prevent blowups from rare out-of-range values
+        pred_x0_clamped = torch.clamp(pred_x0, -1.0, 1.0)
+        target_x0_clamped = torch.clamp(target_x0, -1.0, 1.0)
+        loss_intensity = self.intensity_loss(pred_x0_clamped, target_x0_clamped)
         
         # 3. Gradient loss (edge preservation for sharpness)
-        loss_gradient = self.gradient_loss(pred_x0, target_x0)
+        loss_gradient = self.gradient_loss(pred_x0_clamped, target_x0_clamped)
         
         # Combine losses with adaptive weights (self-supervised only)
         total_loss = (
@@ -339,6 +386,8 @@ def create_dual_objective_loss(config: Dict) -> DualObjectiveLoss:
         intensity_loss_type=loss_config.get('intensity_loss_type', 'mse'),
         gradient_loss_type=loss_config.get('gradient_loss_type', 'l1'),
         intensity_weight_mode=loss_config.get('intensity_weight_mode', 'adaptive'),
+        nll_sigma=loss_config.get('nll_sigma', 0.1),
+        nll_scale=loss_config.get('nll_scale', 0.1),
         use_adaptive_weighting=loss_config.get('use_adaptive_weighting', True),
         warmup_steps=loss_config.get('warmup_steps', 1000)
     )
