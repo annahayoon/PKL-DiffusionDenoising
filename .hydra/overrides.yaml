@@ -1,0 +1,9 @@
+- experiment.device=cuda
+- training.use_ema=false
+- guidance.lambda_base=0.0
+- inference.ddim_steps=20
+- inference.checkpoint_path=checkpoints/best_model.pt
+- inference.input_dir=data/real_microscopy/splits/test/2p
+- inference.output_dir=outputs/tmp_eval_png_test2p
+- data.min_intensity=0
+- data.max_intensity=255

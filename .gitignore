@@ -1,0 +1,140 @@
+# Data and datasets
+data/
+data/real_microscopy/
+datasets/
+wandb/
+runs/
+outputs/
+results/
+checkpoints/
+logs/
+.cache/
+cache/
+tmp/
+temp/
+*.log
+
+# Root level shell scripts and markdown files
+/*.sh
+/*.md
+
+# Exclude baselines/sinsr directory
+baselines/sinsr/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dylib
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+.env.local
+
+# OS files
+.DS_Store
+
+# Model weights and large binaries
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# Numeric datasets
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.tfrecord
+*.tfrecords
+
+# MATLAB/Excel datasets
+*.mat
+*.xls
+*.xlsx
+*.csv
+
+# Build artifacts
+dist/
+build/
+.eggs/
+*.egg-info/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing
+.pytest_cache/
+coverage.xml
+.coverage
+.coverage.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project outputs
+logs/
+outputs/
+checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# SSH keys and certificates
+*.pem
+*.key
+*.crt
+*.p12
+ssh_*
+id_*
+*.rsa
+*.ed25519
+github_ssh_*
+*.ssh
+
+# Test enhancement files
+test_enhancement/
+
+# HPC deployment scripts
+sync_to_hpc.sh
+savio_job.sh
+

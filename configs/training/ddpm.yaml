@@ -1,0 +1,44 @@
+# Training hyperparameters for DDPM - optimized for high memory usage
+batch_size: 4  # Default, overridden in config_real.yaml
+num_workers: 8  # Increased for faster data loading
+max_epochs: 1000
+num_gpus: 1
+gradient_clip: 1.0
+accumulate_grad_batches: 1
+val_check_interval: 1.0
+early_stopping_patience: 20
+learning_rate: 1.0e-4
+weight_decay: 1.0e-6
+use_scheduler: true
+num_timesteps: 1000
+beta_schedule: cosine
+use_ema: true
+supervised_x0_weight: 0.05
+# Memory optimization settings
+persistent_workers: true  # Keep workers alive between epochs
+prefetch_factor: 4        # Prefetch more batches for large batch sizes
+
+# Conditioning toggle: when true, the model expects concatenated [x_t, WF]
+# Set to true for WF-conditioned training; false for unconditioned
+use_conditioning: false
+
+# Conditioning type: 'wf' (concatenate WF), or 'none'
+conditioning_type: wf
+
+# Limit iterations per epoch regardless of dataset size
+steps_per_epoch: 1000
+
+# Multi-GPU / Accelerator options (optional)
+devices: 1               # set >1 for multi-GPU
+accelerator: gpu         # gpu or cpu
+precision: 16-mixed      # 32-true, 16-mixed, bf16-mixed
+distributed:
+  enabled: false         # true to attempt DDP via Lightning
+
+# Enable full Lightning training loop even on single device
+use_lightning: true
+
+# Optional dynamic batch sizing controls
+dynamic_batch_sizing: false
+dynamic_batch_safety_factor: 0.8
+

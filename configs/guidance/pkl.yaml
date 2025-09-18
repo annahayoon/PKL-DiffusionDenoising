@@ -1,0 +1,8 @@
+# Guidance configuration for inference
+type: pkl
+epsilon: 1.0e-6
+lambda_base: 0.1
+schedule:
+  T_threshold: 800
+  epsilon_lambda: 1.0e-3
+

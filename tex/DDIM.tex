@@ -1,0 +1,31 @@
+% DDIM: short and long definitions (standalone include)
+% Usage: place this under an existing section (e.g., Methodology)
+% and include via: \input{DDIM.tex}
+
+\paragraph{DDIM (short definition).}
+Denoising Diffusion Implicit Models (DDIM) \cite{song2021ddim} define a non-Markovian sampling process for diffusion models that preserves the same marginal distributions as DDPM at selected timesteps while allowing large stride and, for $\eta=0$, deterministic sampling. In practice, DDIM enables fast inference with far fewer steps by directly mapping each $\mathbf{x}_t$ to $\mathbf{x}_{t-1}$ without injecting stochastic noise when desired.
+
+\paragraph{DDIM (detailed definition with equations).}
+Let $\beta_t$ be the noise schedule, $\alpha_t = 1-\beta_t$, and $\bar{\alpha}_t = \prod_{s=1}^t \, \alpha_s$. Given a network prediction of the noise $\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)$, the estimated clean image is
+\begin{equation}
+    \mathbf{\hat{x}}_0(\mathbf{x}_t, t) = \frac{1}{\sqrt{\bar{\alpha}_t}}\Big(\mathbf{x}_t - \sqrt{1-\bar{\alpha}_t}\,\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)\Big).
+\end{equation}
+DDIM specifies a family of samplers indexed by $\eta\in[0,1]$ with update
+\begin{align}
+    \mathbf{x}_{t-1} &= \sqrt{\bar{\alpha}_{t-1}}\, \mathbf{\hat{x}}_0 
+    + \sqrt{1-\bar{\alpha}_{t-1}-\sigma_t^2}\, \boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)
+    + \sigma_t \, \mathbf{z}, \quad \mathbf{z}\sim\mathcal{N}(\mathbf{0}, \mathbf{I}), \\
+    \sigma_t &= \eta\, \sqrt{\frac{1-\bar{\alpha}_{t-1}}{1-\bar{\alpha}_t}}\, \sqrt{1-\frac{\bar{\alpha}_t}{\bar{\alpha}_{t-1}}}.
+\end{align}
+Setting $\eta=0$ yields a deterministic sampler:
+\begin{equation}
+    \mathbf{x}_{t-1} = \sqrt{\bar{\alpha}_{t-1}}\, \mathbf{\hat{x}}_0 + \sqrt{1-\bar{\alpha}_{t-1}}\, \boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t),
+\end{equation}
+which can be evaluated on a subsampled time grid for fast inference. When using $v$-parameterization, one may map between $\boldsymbol{\epsilon}_\theta$ and $\mathbf{v}_\theta$ via
+\begin{align}
+    \boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t) &= \sqrt{1-\bar{\alpha}_t}\,\mathbf{x}_t + \sqrt{\bar{\alpha}_t}\,\mathbf{v}_\theta(\mathbf{x}_t, t), \\
+    \mathbf{\hat{x}}_0(\mathbf{x}_t, t) &= \sqrt{\bar{\alpha}_t}\,\mathbf{x}_t - \sqrt{1-\bar{\alpha}_t}\,\mathbf{v}_\theta(\mathbf{x}_t, t),
+\end{align}
+and substitute into the DDIM update above. In all cases, the non-Markovian construction allows consistent endpoints and efficient sampling compared to the original DDPM formulation.
+
+

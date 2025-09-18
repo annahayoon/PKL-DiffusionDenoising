@@ -1,0 +1,49 @@
+ToFix - Bibliography corrections for tex/
+
+In-text citation fixes (edit tex/ICLR_2025.tex):
+- Replace cite key: chung2022diffusion -> chung2023dps (matches bibliography.bib)
+- Add missing cite: stringer2021cellpose (Cellpose, Nature Methods 2021)
+- Resolve/replace: song2022solving — confirm intended work, or replace with an existing cited method (e.g., chung2023dps or wang2022ddnm) or remove
+
+bibliography.bib corrections (edit tex/bibliography.bib):
+- shariatian2025dlpm -> Update to arXiv entry
+  Title: Heavy-Tailed Diffusion with Denoising Lévy Probabilistic Models
+  Authors: Dario Shariatian; Umut Simsekli; Alain Durmus
+  Venue: arXiv preprint arXiv:2407.18609
+  Year: 2025 (current version v4)
+  DOI: 10.48550/arXiv.2407.18609
+  URL: https://arxiv.org/abs/2407.18609
+
+- ADD: stringer2021cellpose
+  Title: Cellpose: a generalist algorithm for cellular segmentation
+  Authors: Carsen Stringer; Tim Wang; Michalis Michaelos; Marius Pachitariu
+  Journal: Nature Methods, 2021, 18:100–106
+  DOI: 10.1038/s41592-020-01018-x
+
+- dpis2024 -> complete metadata
+  Add full author list; keep DOI
+  DOI: 10.34133/icomputing.0082
+  URL: https://spj.science.org/doi/10.34133/icomputing.0082
+
+- augment2024ultrastruct -> complete metadata
+  Add full author list and DOI
+  DOI: 10.1038/s41467-024-49125-z
+  URL: https://www.nature.com/articles/s41467-024-49125-z
+
+- pixel2025vs -> future-dated; complete metadata
+  Add full author list; add DOI or mark in press
+  DOI: 10.1038/s41467-025-60387-z
+  URL: https://www.nature.com/articles/s41467-025-60387-z
+
+- unified2025icml -> complete metadata
+  Add full author list; confirm final title/URL for the ICML 2025 entry
+  URL: https://icml.cc/virtual/2025/poster/43909
+
+- lu2025physics -> verify existence/DOI
+  If published, add DOI and final details; otherwise mark as preprint
+
+- liu2025review -> verify existence/DOI
+  If published, add DOI and final details; otherwise mark as in press/preprint
+
+Optional cleanup:
+- Remove or justify unused classic CV refs (dosovitskiy2020vit, simonyan2014vgg, vaswani2017attention, he2016resnet) if not cited in the manuscript.

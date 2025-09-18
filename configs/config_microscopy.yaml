@@ -1,0 +1,187 @@
+defaults:
+  - model: unet
+  - data: real_pairs
+  - physics: microscopy
+  - guidance: pkl
+  - training: ddpm
+  - override hydra/launcher: basic
+  - _self_
+
+# Experiment configuration
+experiment:
+  name: microscopy_self_supervised_${now:%Y-%m-%d_%H-%M-%S}
+  seed: 42
+  device: cuda  # auto, cuda, cpu
+  mixed_precision: true  # Use mixed precision for better memory efficiency
+
+# Path configuration
+paths:
+  root: ${oc.env:PROJECT_ROOT,.}
+  data: ${paths.root}/data
+  checkpoints: ${paths.root}/checkpoints
+  outputs: ${paths.root}/outputs
+  logs: ${paths.root}/logs
+
+# Weights & Biases logging
+wandb:
+  project: pkl-diffusion-microscopy
+  entity: anna_yoon-uc-berkeley  # Auto-configured from system credentials
+  mode: online  # online, offline, disabled
+
+# Model configuration - Optimized for 256x256 microscopy images
+model:
+  sample_size: 256
+  in_channels: 1  # Will be set to 2 automatically if use_conditioning=true
+  out_channels: 1
+  layers_per_block: 2
+  block_out_channels: [128, 256, 512, 512]  # Increased capacity for 256x256
+  down_block_types: ["DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
+  up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"]
+  class_embed_type: null
+  cross_attention_dim: null
+
+# Training configuration - Optimized for self-supervised microscopy learning
+training:
+  # Core training parameters
+  max_epochs: 1000              # Maximum training epochs (will stop early if converged)
+  num_timesteps: 1000           # Diffusion timesteps (1000 is optimal for quality)
+  beta_schedule: cosine         # cosine schedule works better than linear
+  learning_rate: 1.0e-4         # Stable learning rate for diffusion models
+  weight_decay: 1.0e-6          # L2 regularization
+  
+  # Batch and memory settings - Multi-GPU optimized for 4x NVIDIA A40 (192GB total VRAM)
+  batch_size: 16                # Per GPU batch size (total effective = 16*4 = 64)
+  num_workers: 32               # Total workers across all GPUs
+                                # Rule: num_workers = total_cpus = 32
+  accumulate_grad_batches: 4    # Effective batch size = 16 * 4 = 64 (large effective batch)
+  gradient_clip: 1.0            # Gradient clipping for stability
+  
+  # Memory optimization - Tuned for A40 (46GB VRAM)
+  persistent_workers: true      # Keep workers alive between epochs
+  prefetch_factor: 8            # Increased prefetch for high-core CPU
+  pin_memory: true              # Pin memory for faster GPU transfer
+  
+  # GPU Memory scaling guide for 256x256 + conditioning (tested values):
+  # - A40/A100 (40-80GB): batch_size: 16 + accumulate_grad_batches: 4-6
+  # - RTX 4090 (24GB): batch_size: 12 + accumulate_grad_batches: 3-4
+  # - RTX 3090 (24GB): batch_size: 8 + accumulate_grad_batches: 4
+  # - RTX 3080 (10GB): batch_size: 4 + accumulate_grad_batches: 4
+  # - RTX 3070 (8GB): batch_size: 2 + accumulate_grad_batches: 8
+  
+  # Model training enhancements
+  use_ema: true                 # Exponential moving average for stable inference
+  use_conditioning: false       # Disable WF conditioning for pure self-supervised learning
+  conditioning_type: none       # No conditioning for grayscale microscopy
+  
+  # Learning rate scheduling and early stopping
+  use_scheduler: true           # Enable adaptive learning rate
+  scheduler_type: cosine        # Cosine annealing scheduler
+  scheduler_warmup_steps: 1000  # Warmup steps for learning rate
+  
+  # Early stopping configuration
+  early_stopping_patience: 25  # Stop if no improvement for 25 epochs
+  early_stopping_min_delta: 1e-5  # Minimum change to qualify as improvement
+  early_stopping_monitor: val_loss  # Metric to monitor
+  
+  # Self-supervised learning specific parameters
+  supervised_x0_weight: 0.0     # Disabled for pure self-supervised learning
+  ddpm_loss_weight: 1.0         # Weight for standard DDPM loss
+  cycle_loss_weight: 0.15       # Weight for cycle consistency loss (slightly higher)
+  perceptual_loss_weight: 0.01  # Weight for perceptual loss
+  cycle_loss_type: smooth_l1    # smooth_l1, l1, or l2 (smooth_l1 is more robust)
+  use_perceptual_loss: true     # Enable perceptual loss for better quality
+  
+  # Training validation and checkpointing
+  val_check_interval: 1.0       # Validate every epoch
+  save_every_n_epochs: 10       # Save checkpoint every 10 epochs
+  log_every_n_steps: 100        # Log metrics every 100 steps
+  
+  # Advanced training options
+  steps_per_epoch: 1000         # Limit steps per epoch for consistent timing
+  precision: 16-mixed           # Mixed precision training
+  
+# Data configuration
+data:
+  image_size: 256               # Image size for training
+  min_intensity: 0              # Minimum intensity value
+  max_intensity: 255            # Maximum intensity value (adjust based on your data)
+  noise_model: poisson          # poisson, gaussian, poisson_gaussian
+  use_zarr: false               # Set to true for very large datasets
+  
+  # Generalized Anscombe Transform parameters (for poisson_gaussian noise)
+  gat:
+    alpha: 1.0                  # Poisson scaling factor
+    mu: 0.0                     # Gaussian mean
+    sigma: 0.0                  # Gaussian standard deviation
+
+# PSF configuration for self-supervised cycle consistency
+psf:
+  type: gaussian                # Type of PSF (gaussian, file, measured)
+  sigma_x: 2.0                  # Standard deviation in x direction (adjust for your system)
+  sigma_y: 2.0                  # Standard deviation in y direction
+  size: 21                      # PSF kernel size (should be odd)
+  background: 0.0               # Background intensity level
+
+# Physics configuration
+physics:
+  psf_type: gaussian
+  psf_size: 21
+  background: 0.0
+  noise_type: poisson
+
+# Guidance configuration
+guidance:
+  type: pkl                     # pkl, l2, anscombe
+  epsilon: 1e-6                 # Guidance strength
+  schedule_type: adaptive       # adaptive, linear, constant
+  lambda_base: 0.1              # Base guidance weight
+  schedule:
+    T_threshold: 800            # Threshold for adaptive scheduling
+    epsilon_lambda: 1e-3        # Adaptive scheduling parameter
+
+# Evaluation configuration
+evaluation:
+  metrics: ["psnr", "ssim", "frc"]  # Metrics to compute
+  save_samples: true            # Save sample outputs during training
+  num_samples: 8                # Number of samples to save
+  eval_every_n_epochs: 5        # Evaluate every N epochs
+
+# Inference configuration
+inference:
+  ddim_steps: 50                # Number of DDIM sampling steps
+  eta: 0.0                      # DDIM eta parameter (0.0 = deterministic)
+  use_autocast: true            # Use automatic mixed precision
+  batch_size: 4                 # Inference batch size
+  guidance_scale: 1.0           # Guidance scale for sampling
+
+# Hardware optimization - Multi-GPU setup
+hardware:
+  devices: 4                    # Number of GPUs (4x A40)
+  accelerator: gpu              # gpu, cpu, tpu
+  strategy: ddp                 # Distributed Data Parallel for multi-GPU
+  sync_batchnorm: true          # Synchronize batch norm across devices
+  
+# Logging and monitoring
+logging:
+  log_level: INFO               # DEBUG, INFO, WARNING, ERROR
+  log_every_n_steps: 100        # Log frequency
+  save_top_k: 3                 # Keep top K checkpoints
+  monitor_metric: val_loss      # Metric to monitor for best checkpoint
+  
+# Memory and performance optimization
+optimization:
+  compile_model: false          # PyTorch 2.0 model compilation (experimental)
+  channels_last: false          # Use channels last memory format
+  benchmark_cudnn: true         # Enable cuDNN benchmarking
+  deterministic: false          # Deterministic training (slower but reproducible)
+  
+# Data augmentation (optional)
+augmentation:
+  enabled: false                # Enable data augmentation
+  horizontal_flip: 0.5          # Probability of horizontal flip
+  vertical_flip: 0.5            # Probability of vertical flip
+  rotation: 0.1                 # Maximum rotation angle (fraction of 2π)
+  
+# Resume training (optional)
+# resume_checkpoint: null       # Path to checkpoint to resume from
+# resume_start_epoch: 0         # Epoch to start from when resuming

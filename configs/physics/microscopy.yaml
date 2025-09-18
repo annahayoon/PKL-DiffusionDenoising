@@ -1,0 +1,20 @@
+# Physics / forward model configuration
+use_psf: true
+psf_path: null
+background: 0.0
+read_noise_sigma: 0.0
+
+# Optional bead-based PSF estimation
+use_bead_psf: true
+beads_dir: ${paths.data}/real_microscopy/beads  # Merged beads location
+bead_crop_size: 33
+# If both are available, choose key: "with_AO" or "no_AO"; when null, auto-select
+bead_mode: "with_AO"  # Use AO-corrected PSF for better quality
+
+# Pixel size configuration for PSF scaling
+# PSF pixel size: 781.25 nm/pixel (200μm FOV ÷ 256 pixels from bead metadata)
+# Target pixel size: 97.65 nm/pixel (200μm FOV ÷ 2048 pixels for WF/2P images)  
+# Scaling factor: 781.25 / 97.65 ≈ 8.0x (PSF will be upsampled by ~8x)
+target_pixel_size_xy_nm: 97.65   # Target XY pixel size in nanometers (WF/2P images)
+target_pixel_size_z_nm: null     # Target Z pixel size in nanometers (optional)
+

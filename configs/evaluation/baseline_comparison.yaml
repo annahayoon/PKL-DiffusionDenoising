@@ -1,0 +1,46 @@
+# Baseline Comparison Mode Configuration
+# Focused comparison between traditional baselines
+
+defaults:
+  - ../unified_evaluation
+
+# Override mode
+mode: "baseline_comparison"
+
+# Baseline comparison specific settings
+experiment:
+  name: "baseline_comparison"
+  output_dir: "outputs/baseline_comparison"
+
+processing:
+  patch_size: 256
+  stride: 128
+  max_images: 20  # Reasonable number for statistical analysis
+  rl_iterations: 30
+  significance_level: 0.05
+  save_individual_comparisons: true
+  save_summary_plots: true
+
+# Focus on key comparison metrics
+metrics:
+  image_quality: ["psnr", "ssim", "frc", "mse"]
+  perceptual: ["sar", "sharpness", "contrast"]
+  downstream: ["cellpose_f1", "hausdorff_distance"]
+  robustness: []  # Skip robustness for baseline comparison
+
+# Enable all baselines
+baselines:
+  use_richardson_lucy: true
+  use_rcan: true  # Enable if RCAN checkpoint available
+  richardson_lucy_iterations: 30
+
+# Required: set PSF path for Richardson-Lucy
+physics:
+  use_psf: true
+  psf_path: "data/psf/psf.tif"  # Update with actual PSF path
+
+wandb:
+  tags: 
+    - "baseline_comparison"
+    - "statistical_analysis"
+  job_type: "baseline_comparison"

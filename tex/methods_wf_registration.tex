@@ -1,0 +1,30 @@
+% Methods: Cross-modality registration (2p to WF)
+
+\subsection{Cross-modality registration of two-photon to widefield: spatial high-pass filtering and WF warping}
+
+To align two-photon (2p) images to widefield (WF) maps, we developed a robust preprocessing pipeline that combines WF distortion correction with spatial high-pass filtering, followed by coarse-to-fine geometric alignment. This preprocessing is performed once per dataset and produces registered image pairs for subsequent diffusion model training.
+
+\subsubsection*{Spatial high-pass filtering}
+Low-frequency illumination and hemodynamic background were suppressed by subtracting a Gaussian-blurred version of each image. Let $I$ denote the image and $G_{\sigma}$ an isotropic Gaussian with standard deviation $\sigma$ (expressed in $\mu$m and converted to pixels using the calibration):
+\[
+I_{\mathrm{hp}} \;=\; I \;-\; (G_{\sigma_{\mathrm{low}}} * I).
+\]
+To stabilize contrast across fields of view, we optionally applied local normalization:
+\[
+\hat{I} \;=\; \frac{I_{\mathrm{hp}}}{\epsilon + (G_{\sigma_{\mathrm{norm}}} * \lvert I_{\mathrm{hp}} \rvert)},
+\]
+with $\epsilon=10^{-6}$. Typical values were $\sigma_{\mathrm{low}} = 50\text{--}100\,\mu\mathrm{m}$ for WF and $15\text{--}40\,\mu\mathrm{m}$ for 2p, and $\sigma_{\mathrm{norm}} = 200\text{--}500\,\mu\mathrm{m}$.
+This filter preserves vessel edges and other fine features that are common to both modalities, improving the robustness of the subsequent registration. All transforms were estimated on the high-pass images but applied to the corresponding unfiltered images.
+
+\subsubsection*{WF distortion correction and registration}
+Prior to cross-modality alignment, WF images undergo distortion correction using either measured camera calibration parameters or a radial distortion model fitted via grid-search optimization against the 2P reference. We then matched the physical scale by resampling the 2p reference image (mean of the motion-corrected stack) to the WF pixel size using the microscope calibration (isotropic in $\mu$m/px). Registration proceeded in three stages on a Gaussian pyramid of the high-pass filtered images:
+
+\begin{enumerate}
+  \item \textbf{Rigid initialization} (translation/rotation) via phase correlation with a Hann window, yielding transform $T_{0}$.
+  \item \textbf{Affine refinement} by maximizing normalized cross-correlation (NCC) over downsampled levels, initialized from $T_{0}$, producing $T_{\mathrm{aff}}$.
+  \item \textbf{Non-rigid warping} using a free-form B-spline transform with control-point spacing of $0.75\text{--}1.5\,\mathrm{mm}$ in WF space and bending-energy regularization $\lambda \in [10^{-4}, 10^{-2}]$, initialized from $T_{\mathrm{aff}}$. Optimization used NCC on the high-pass images.
+\end{enumerate}
+
+The final transform $T$ was applied to warp the WF maps into the 2p coordinate frame, producing registered image pairs for training. The complete preprocessing pipeline (implemented in \texttt{preprocessWF\_TP.py}) outputs distortion-corrected WF images (\texttt{wf\_unwarp.tif}), high-pass filtered WF (\texttt{wf\_hp\_temp.tif}), registered 2P images (\texttt{tp\_reg.tif}), and train/validation/test splits. Quality control included visual overlay of vessel maps and landmark error computation on vessel bifurcations; median reprojection errors were typically below $50\,\mu\mathrm{m}$.
+
+\paragraph{Notes} (i) All $\sigma$ values are specified in $\mu$m and converted to pixels per dataset. (ii) If vessel contrast is weak, a bandpass variant ($G_{\sigma_1} * I - G_{\sigma_2} * I$ with $\sigma_1 \ll \sigma_2$) can further enhance mid-scale features before registration. (iii) The same pipeline works symmetrically to warp 2p into WF if required.

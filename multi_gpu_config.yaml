@@ -1,0 +1,176 @@
+defaults:
+  - model: unet
+  - data: real_pairs
+  - physics: microscopy
+  - guidance: pkl
+  - training: ddpm
+  - override hydra/launcher: basic
+  - _self_
+
+# MULTI-GPU CONFIGURATION FOR FASTER TRAINING
+# Optimized for 2x A40 GPUs on Savio
+
+# Experiment configuration
+experiment:
+  name: microscopy_multi_gpu_${now:%Y-%m-%d_%H-%M-%S}
+  seed: 42
+  device: cuda
+  mixed_precision: true
+
+# Path configuration
+paths:
+  root: ${oc.env:PROJECT_ROOT,.}
+  data: ${paths.root}/data
+  checkpoints: ${paths.root}/checkpoints
+  outputs: ${paths.root}/outputs
+  logs: ${paths.root}/logs
+
+# Weights & Biases logging
+wandb:
+  project: pkl-diffusion-microscopy
+  entity: anna_yoon-uc-berkeley
+  mode: online
+
+# Model configuration - Full resolution with multi-GPU support
+model:
+  sample_size: 256                  # Keep full resolution
+  in_channels: 1
+  out_channels: 1
+  layers_per_block: 2
+  block_out_channels: [128, 256, 512, 512]  # Full model capacity
+  down_block_types: ["DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
+  up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"]
+  class_embed_type: null
+  cross_attention_dim: null
+  use_psf_conditioning: false
+
+# Multi-GPU Training configuration
+training:
+  # Core training parameters
+  max_epochs: 100                   # More epochs with faster training
+  num_timesteps: 1000               # Full timesteps for quality
+  beta_schedule: cosine
+  learning_rate: 2.0e-4             # Higher LR for larger effective batch
+  weight_decay: 1.0e-6
+  
+  # Multi-GPU batch settings - Optimized for 2x A40 GPUs
+  batch_size: 24                    # Per GPU batch size (total = 24*2 = 48)
+  num_workers: 16                   # Total workers across GPUs
+  accumulate_grad_batches: 2        # Effective batch = 48*2 = 96
+  gradient_clip: 1.0
+  
+  # Memory optimization for multi-GPU
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory: true
+  
+  # Model training enhancements
+  use_ema: true
+  use_conditioning: false
+  conditioning_type: none
+  
+  # Learning rate scheduling
+  use_scheduler: true
+  scheduler_type: cosine
+  scheduler_warmup_steps: 1000
+  
+  # Early stopping for time efficiency
+  early_stopping_patience: 20       # Balanced patience
+  early_stopping_min_delta: 1e-5
+  early_stopping_monitor: val_loss
+  
+  # Self-supervised learning parameters
+  supervised_x0_weight: 0.0
+  ddpm_loss_weight: 1.0
+  cycle_loss_weight: 0.15
+  perceptual_loss_weight: 0.01
+  cycle_loss_type: smooth_l1
+  use_perceptual_loss: true         # Keep for quality
+  
+  # Training validation and checkpointing
+  val_check_interval: 1.0
+  save_every_n_epochs: 10
+  log_every_n_steps: 100
+  
+  # Advanced training options
+  steps_per_epoch: 1000             # Full steps for thorough training
+  precision: 16-mixed
+
+# Data configuration
+data:
+  image_size: 256                   # Full resolution
+  min_intensity: 0
+  max_intensity: 255
+  noise_model: poisson
+  use_zarr: false
+  
+  # Generalized Anscombe Transform parameters
+  gat:
+    alpha: 1.0
+    mu: 0.0
+    sigma: 0.0
+
+# PSF configuration
+psf:
+  type: gaussian
+  sigma_x: 2.0                      # Full PSF parameters
+  sigma_y: 2.0
+  size: 21
+  background: 0.0
+
+# Physics configuration
+physics:
+  psf_type: gaussian
+  psf_size: 21
+  background: 0.0
+  noise_type: poisson
+
+# Guidance configuration
+guidance:
+  type: pkl
+  epsilon: 1e-6
+  schedule_type: adaptive
+  lambda_base: 0.1
+  schedule:
+    T_threshold: 800
+    epsilon_lambda: 1e-3
+
+# Evaluation configuration
+evaluation:
+  metrics: ["psnr", "ssim", "frc"]  # Full metrics
+  save_samples: true
+  num_samples: 8
+  eval_every_n_epochs: 5
+
+# Inference configuration
+inference:
+  ddim_steps: 50                    # Full inference steps
+  eta: 0.0
+  use_autocast: true
+  batch_size: 8                     # Per GPU inference batch
+  guidance_scale: 1.0
+
+# Hardware optimization for multi-GPU
+hardware:
+  devices: 2                        # 2 GPUs
+  accelerator: gpu
+  strategy: ddp                     # Distributed Data Parallel
+  sync_batchnorm: true              # Sync batch norm across GPUs
+  
+# Logging and monitoring
+logging:
+  log_level: INFO
+  log_every_n_steps: 100
+  save_top_k: 3
+  monitor_metric: val_loss
+  
+# Memory and performance optimization
+optimization:
+  compile_model: true               # PyTorch 2.0 compilation
+  channels_last: true               # Better memory layout
+  benchmark_cudnn: true
+  deterministic: false
+  
+# Data augmentation (optional)
+augmentation:
+  enabled: false

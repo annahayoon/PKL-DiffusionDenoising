@@ -1,0 +1,191 @@
+# Unified Evaluation Configuration
+# Supports all evaluation modes in one configuration file
+
+# Evaluation mode - determines which evaluation to run
+mode: "standard"  # Options: standard, full_fov, baseline_comparison, cross_method_analysis
+
+# Experiment settings
+experiment:
+  device: "cuda"
+  seed: 42
+  name: "unified_evaluation"
+  output_dir: "outputs/unified_evaluation"
+
+# Data configuration
+data:
+  image_size: 256
+  min_intensity: 0.0
+  max_intensity: 1.0
+  noise_model: "poisson"  # gaussian, poisson, poisson_gaussian
+  gat:
+    alpha: 1.0
+    mu: 0.0
+    sigma: 0.0
+
+# Model configuration  
+model:
+  in_channels: 1
+  out_channels: 1
+  model_channels: 128
+  num_res_blocks: 2
+  attention_resolutions: [16, 8]
+  channel_mult: [1, 2, 2, 2]
+  num_heads: 4
+  use_scale_shift_norm: true
+  dropout: 0.0
+  resblock_updown: true
+  use_new_attention_order: false
+
+# Training configuration
+training:
+  num_timesteps: 1000
+  use_conditioning: false
+  conditioning_type: "wf"
+  beta_schedule: "linear"
+  beta_start: 0.0001
+  beta_end: 0.02
+
+# Physics configuration
+physics:
+  use_psf: true
+  psf_path: "data/psf/psf.tif"  # Update with your PSF path
+  use_bead_psf: false
+  beads_dir: "data/beads"
+  bead_mode: null
+  background: 0.0
+  read_noise_sigma: 0.0
+
+# PSF configuration
+psf:
+  type: "gaussian"
+  sigma_x: 2.0
+  sigma_y: 2.0
+  size: 21
+
+# Guidance configuration
+guidance:
+  epsilon: 1e-6
+  lambda_base: 0.1
+  schedule:
+    T_threshold: 800
+    epsilon_lambda: 1e-3
+
+# Inference configuration
+inference:
+  checkpoint_path: "checkpoints/best_model.pt"
+  input_dir: "data/test/wf"
+  gt_dir: "data/test/2p"
+  mask_dir: "data/test/masks"
+  output_dir: "outputs/unified_evaluation"
+  ddim_steps: 50
+  eta: 0.0
+  use_autocast: true
+  batch_size: 1
+
+# Processing configuration - NEW for unified system
+processing:
+  # Patch processing parameters
+  patch_size: 256
+  stride: 128
+  feather_size: null  # Auto-computed as stride//2
+  
+  # General processing
+  max_images: null  # Process all images, or set to limit
+  
+  # Richardson-Lucy parameters
+  rl_iterations: 30
+  
+  # Statistical analysis
+  significance_level: 0.05
+  
+  # Visualization parameters
+  percentile_clip: 99.5
+  save_individual_comparisons: true
+  save_summary_plots: true
+
+# Metrics configuration - specify which metrics to compute
+metrics:
+  # Standard image quality metrics
+  image_quality:
+    - "psnr"
+    - "ssim" 
+    - "frc"
+    - "mse"
+    - "mae"
+    - "snr"
+  
+  # Perceptual and advanced metrics
+  perceptual:
+    - "sar"
+    - "sharpness"
+    - "contrast"
+    - "entropy"
+    - "local_variance"
+    - "spectral_angle"
+  
+  # Downstream task metrics
+  downstream:
+    - "cellpose_f1"
+    - "hausdorff_distance"
+    - "dice_coefficient"
+    - "iou"
+  
+  # Robustness metrics
+  robustness:
+    - "noise_robustness"
+    - "hallucination_score"
+  
+  # Metric-specific parameters
+  frc_threshold: 0.143
+  noise_robustness_levels: [0.01, 0.02, 0.05, 0.1]
+  
+  # Output options
+  save_individual_results: true
+  save_summary_plots: true
+  save_comparison_images: true
+
+# Baseline methods configuration
+baselines:
+  rcan_checkpoint: null  # Set path to RCAN checkpoint if available
+  richardson_lucy_iterations: 30
+  use_richardson_lucy: true
+  use_rcan: false
+
+# Cross-method analysis paths - only used when mode=cross_method_analysis
+cross_analysis:
+  pkl_dir: "outputs/pkl_results"
+  l2_dir: "outputs/l2_results"
+  anscombe_dir: "outputs/anscombe_results"
+  rl_dir: "outputs/rl_results"
+  rcan_dir: "outputs/rcan_results"
+
+# Weights & Biases configuration
+wandb:
+  mode: "online"  # online, offline, disabled
+  project: "pkl-diffusion-unified-evaluation"
+  entity: anna_yoon-uc-berkeley  # Auto-configured from system credentials
+  tags: 
+    - "unified_evaluation"
+    - "pkl"
+    - "microscopy"
+  notes: "Unified evaluation system with all modes"
+  group: "development"
+  job_type: "evaluation"
+
+# Paths configuration
+paths:
+  data: "data"
+  checkpoints: "checkpoints"
+  outputs: "outputs"
+  logs: "logs"
+
+# Hydra configuration
+defaults:
+  - _self_
+
+hydra:
+  job:
+    name: unified_evaluation_${mode}
+    chdir: false
+  run:
+    dir: outputs/unified_evaluation/${now:%Y-%m-%d}/${now:%H-%M-%S}

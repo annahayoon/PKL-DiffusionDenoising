@@ -1,0 +1,57 @@
+# SID (See-in-the-Dark) Cross-Domain Evaluation Configuration
+# 
+# This configuration enables evaluation of microscopy-trained PKL diffusion models
+# on the SID natural image dataset to demonstrate cross-domain generalization.
+
+defaults:
+  - ../unified_evaluation
+
+# Override mode
+mode: "sid_evaluation"
+
+# SID evaluation specific settings
+experiment:
+  name: "SID Cross-Domain Generalization"
+  description: "Evaluate PKL diffusion model trained on microscopy data on SID natural images"
+  output_dir: "results/sid_evaluation"
+  cross_domain: true
+  dataset_source: "microscopy"
+  dataset_target: "sid_natural_images"
+
+# Processing configuration with SID-specific parameters
+processing:
+  # Standard processing parameters
+  patch_size: 256
+  max_images: 100  # Set to null for all images, or specific number for testing
+  
+  # SID-specific parameters
+  sid_camera_type: "Sony"  # "Sony" or "Fuji"
+  sid_data_dir: "data/SID"
+  sid_use_processed: true  # Use processed 16-bit images instead of RAW
+  sid_guidance_types: ["pkl", "l2", "anscombe"]  # Guidance strategies to evaluate
+  sid_num_steps: 50        # DDIM sampling steps
+  sid_guidance_scale: 0.1  # Guidance scale
+  sid_eta: 0.0            # DDIM eta parameter
+  
+  # Visualization and analysis
+  save_summary_plots: true
+  save_individual_comparisons: false  # Set to true to save individual image comparisons
+
+# Focus on key metrics for cross-domain evaluation
+metrics:
+  image_quality: ["psnr", "ssim"]
+  perceptual: ["lpips"]  # Will be computed if lpips is available
+  downstream: []  # Skip downstream tasks for SID evaluation
+  robustness: []  # Skip robustness tests for cross-domain evaluation
+  
+# Weights & Biases configuration
+wandb:
+  project: "pkl-diffusion-sid"
+  name: "sid_cross_domain_evaluation"
+  tags: 
+    - "sid"
+    - "cross_domain" 
+    - "generalization"
+    - "iclr"
+    - "natural_images"
+  job_type: "cross_domain_evaluation"

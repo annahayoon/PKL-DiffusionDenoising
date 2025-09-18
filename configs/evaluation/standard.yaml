@@ -1,0 +1,31 @@
+# Standard Evaluation Mode Configuration
+# For regular image evaluation without patch processing
+
+defaults:
+  - ../unified_evaluation
+
+# Override mode
+mode: "standard"
+
+# Standard evaluation specific settings
+experiment:
+  name: "standard_evaluation"
+  output_dir: "outputs/standard_evaluation"
+
+processing:
+  max_images: null  # Process all images
+  save_individual_comparisons: true
+  save_summary_plots: true
+
+# Use comprehensive metrics for standard evaluation
+metrics:
+  image_quality: ["psnr", "ssim", "frc", "mse", "mae", "snr"]
+  perceptual: ["sar", "sharpness", "contrast", "entropy"]
+  downstream: ["cellpose_f1", "hausdorff_distance"]
+  robustness: ["noise_robustness", "hallucination_score"]
+
+wandb:
+  tags: 
+    - "standard_evaluation"
+    - "comprehensive_metrics"
+  job_type: "standard_evaluation"
