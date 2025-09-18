@@ -674,6 +674,34 @@ def save_16bit_comparison(
 
 
 # =============================================================================
+# Backward-compatibility utilities
+# =============================================================================
+
+def convert_8bit_to_16bit_equivalent(x: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+    """Convert 8-bit [0, 255] values to 16-bit-equivalent [0, 65535].
+
+    This preserves relative intensity by simple scaling. The output is float32
+    in the 16-bit intensity domain to match the rest of this module.
+
+    Args:
+        x: Input array/tensor in 8-bit range
+
+    Returns:
+        Array/tensor scaled to 16-bit range as float32
+    """
+    if x is None:
+        return None
+
+    scale = float(UINT16_MAX / 255.0)
+
+    if isinstance(x, torch.Tensor):
+        return (x.float() * scale).clamp(UINT16_MIN, UINT16_MAX)
+    else:
+        arr = np.asarray(x, dtype=np.float32)
+        arr = arr * scale
+        return np.clip(arr, UINT16_MIN, UINT16_MAX).astype(np.float32)
+
+# =============================================================================
 # Adaptive Normalization Utility Functions
 # =============================================================================
 

@@ -855,7 +855,9 @@ class DDPMTrainer(LightningModuleBase):
             # Log advanced feature metrics
             self._log_advanced_metrics(batch_idx, loss)
         
+        # Log per-step and per-epoch variants for flexible callbacks
         self._log_if_trainer("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self._log_if_trainer("train/loss_step", loss, prog_bar=False, on_step=True, on_epoch=False)
         if self.use_ema and self.global_step % 10 == 0:
             self._update_ema()
         # advance step counter in fallback environments

@@ -144,8 +144,10 @@ training:
           factor: 0.5
   
   # VALIDATION AND CHECKPOINTING - Best practices for diffusion training
-  val_check_interval: 1.0      # Validate at end of each epoch (standard practice)
-  log_every_n_steps: 50        # Log training metrics every 50 steps (more frequent)
+  # STEP-BASED VALIDATION/LOGGING
+  val_check_interval: 5000     # Validate every 5000 steps
+  metrics_log_steps: 5000      # Print train/val every 5000 steps
+  log_every_n_steps: 100       # Lightning internal log flush cadence
   save_every_n_epochs: 5       # Save checkpoint every 5 epochs
   
   # PERFORMANCE OPTIMIZATIONS - A40 specific with memory safety

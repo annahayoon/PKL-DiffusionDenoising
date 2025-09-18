@@ -62,7 +62,7 @@ import json
 try:
     import pytorch_lightning as pl
     from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-    from pytorch_lightning.loggers import WandbLogger
+    from pytorch_lightning.loggers import WandbLogger, CSVLogger
     HAS_LIGHTNING = True
     print(f"✅ PyTorch Lightning {pl.__version__} imported successfully")
 except ImportError as e:
@@ -293,11 +293,25 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     logger = logging.getLogger(__name__)
     logger.info(f"Starting training with config: {cfg.experiment.name}")
     print(f"✅ Initialized file logging: {log_file}")
+
+    # If W&B is active, ensure the run name matches the file log stem for consistency
+    try:
+        if cfg.wandb.mode != "disabled" and getattr(wandb, "run", None) is not None:
+            wandb.run.name = log_file.stem
+    except Exception:
+        pass
     
     print(f"Device: {device}")
     print(f"Data directory: {data_dir}")
     print(f"Checkpoint directory: {checkpoint_dir}")
     print(f"Training logs: {log_file}")
+
+    # Setup outputs directory for saving reconstructions/visualizations
+    if Path(cfg.paths.outputs).is_absolute():
+        outputs_dir = Path(cfg.paths.outputs)
+    else:
+        outputs_dir = project_root / cfg.paths.outputs
+    outputs_dir.mkdir(parents=True, exist_ok=True)
 
     # Create transform based on noise model
     noise_model = str(getattr(cfg.data, "noise_model", "gaussian")).lower()
@@ -739,7 +753,8 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             config_name = Path(args.config).stem if args.config else "default"
-            run_name = f"{config_name}_{cfg.experiment.name}_{timestamp}"
+            # Use the same naming as the file logger
+            run_name = log_file.stem
             
             wandb_logger = WandbLogger(
                 project=cfg.wandb.project,
@@ -749,6 +764,12 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
                 tags=[config_name, cfg.experiment.name, f"seed_{cfg.experiment.seed}"]
             )
             print(f"✅ Initialized Lightning W&B logger: {run_name}")
+
+        # Always add a CSV logger with the same run name so metrics.csv path matches
+        csv_logger = CSVLogger(
+            save_dir=str(project_root / "lightning_logs"),
+            name=log_file.stem
+        )
 
         # Setup Lightning callbacks
         callbacks = []
@@ -789,6 +810,160 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
                     )
                     print(msg)
                     self._logger.info(msg)
+
+        class PeriodicStepMetricsLogger(pl.Callback):
+            """Log train/val losses every fixed number of training steps (default: 5000)."""
+            def __init__(self, file_logger, step_interval: int = 5000):
+                super().__init__()
+                self._logger = file_logger
+                self.step_interval = int(step_interval)
+
+            def on_validation_end(self, trainer, pl_module):
+                if hasattr(trainer, 'is_global_zero') and not trainer.is_global_zero:
+                    return
+                # Called whenever validation runs; align validation to the desired step cadence
+                step = int(getattr(trainer, 'global_step', 0))
+                if self.step_interval > 0 and step > 0 and step % self.step_interval == 0:
+                    metrics = trainer.callback_metrics
+                    # Extract best-effort train/val losses
+                    def _get(metrics_dict, keys):
+                        for k in keys:
+                            if k in metrics_dict:
+                                v = metrics_dict[k]
+                                try:
+                                    return float(v)
+                                except Exception:
+                                    return v.item() if hasattr(v, 'item') else None
+                        return None
+                    # Prefer per-step training loss if available
+                    train_loss = _get(metrics, ['train/loss_step', 'train/loss_epoch', 'train/loss'])
+                    val_loss = _get(metrics, ['val/loss_epoch', 'val/loss'])
+                    msg = (
+                        f"Step {step} (Epoch {trainer.current_epoch + 1}) - "
+                        f"Train Loss: {train_loss if train_loss is not None else 'N/A'}, "
+                        f"Val Loss: {val_loss if val_loss is not None else 'N/A'}"
+                    )
+                    print(msg)
+                    self._logger.info(msg)
+
+        class PeriodicFullFrameReconstructionSaver(pl.Callback):
+            """Save a full-frame reconstruction every fixed number of training steps (default: 10000)."""
+            def __init__(self, 
+                         file_logger,
+                         outputs_path: Path,
+                         data_root: Path,
+                         cfg: DictConfig,
+                         step_interval: int = 10000):
+                super().__init__()
+                self._logger = file_logger
+                self.outputs_path = outputs_path
+                self.data_root = data_root
+                self.cfg = cfg
+                self.step_interval = int(step_interval)
+
+            def _find_validation_frame(self) -> Optional[Path]:
+                # Try to find a reasonably large validation WF image
+                candidates = []
+                for rel in [
+                    Path('val_full') / 'wf',
+                    Path('val') / 'wf',
+                ]:
+                    search_dir = (self.data_root / rel)
+                    if search_dir.exists():
+                        for ext in ('*.tif', '*.tiff', '*.png', '*.jpg'):
+                            candidates.extend(sorted(search_dir.glob(ext)))
+                return candidates[0] if candidates else None
+
+            def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+                if hasattr(trainer, 'is_global_zero') and not trainer.is_global_zero:
+                    return
+                step = int(getattr(trainer, 'global_step', 0))
+                if self.step_interval <= 0 or step == 0 or step % self.step_interval != 0:
+                    return
+
+                try:
+                    import tifffile
+                    from PIL import Image
+                    import numpy as np
+                    import torch
+                except Exception as e:
+                    self._logger.warning(f"Reconstruction deps missing at step {step}: {e}")
+                    return
+
+                frame_path = self._find_validation_frame()
+                if frame_path is None:
+                    self._logger.info(f"[Reconstruct @ {step}] No validation frame found; skipping.")
+                    return
+
+                # Load frame
+                try:
+                    if frame_path.suffix.lower() in ['.tif', '.tiff']:
+                        wf = tifffile.imread(str(frame_path)).astype(np.float32)
+                    else:
+                        wf = np.array(Image.open(frame_path)).astype(np.float32)
+                except Exception as e:
+                    self._logger.warning(f"[Reconstruct @ {step}] Failed to read {frame_path}: {e}")
+                    return
+
+                # Prepare tensor (1,1,H,W)
+                if wf.ndim == 2:
+                    wf_t = torch.from_numpy(wf)[None, None]
+                elif wf.ndim == 3 and wf.shape[0] in (1, 3):
+                    wf_t = torch.from_numpy(wf[:1])[None]
+                else:
+                    # Fallback to single-channel
+                    wf_t = torch.from_numpy(wf[..., :1].squeeze(-1))[None, None]
+
+                device = next(pl_module.parameters()).device
+                wf_t = wf_t.to(device=device, dtype=torch.float32)
+
+                # Build sampler from trainer (guidance optional)
+                try:
+                    from pkl_dg.models.sampler import DDIMSampler
+                    sampler = DDIMSampler.from_ddpm_trainer(
+                        trainer=pl_module,
+                        forward_model=getattr(pl_module, 'forward_model', None),
+                        guidance_strategy=None,  # Optional; falls back to unguided if None
+                        schedule=None,
+                        ddim_steps=int(getattr(self.cfg.inference, 'ddim_steps', 50)),
+                        eta=float(getattr(self.cfg.inference, 'eta', 0.0)),
+                    )
+                except Exception as e:
+                    self._logger.warning(f"[Reconstruct @ {step}] Failed to create sampler: {e}")
+                    return
+
+                # Run sampling (may be heavy for large frames; best-effort only)
+                try:
+                    with torch.no_grad():
+                        pred = sampler.sample(
+                            y=wf_t,
+                            shape=tuple(wf_t.shape),
+                            device=device,
+                            verbose=False,
+                        )
+                        pred_np = pred.squeeze().detach().cpu().numpy().astype(np.float32)
+                        # Normalize to >=0 for 16-bit save
+                        pred_np = np.clip(pred_np, a_min=0.0, a_max=None)
+                except Exception as e:
+                    self._logger.warning(f"[Reconstruct @ {step}] Sampling failed: {e}")
+                    return
+
+                # Save as 16-bit TIFF
+                try:
+                    import tifffile
+                    save_dir = self.outputs_path / 'reconstructions'
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    out_path = save_dir / f"reconstruction_step_{step:06d}.tif"
+                    # Scale to 16-bit range using min-max per frame
+                    pmin, pmax = float(pred_np.min()), float(pred_np.max())
+                    if pmax > pmin:
+                        pred_norm = (pred_np - pmin) / (pmax - pmin)
+                    else:
+                        pred_norm = np.zeros_like(pred_np)
+                    tifffile.imwrite(str(out_path), (pred_norm * 65535).astype(np.uint16))
+                    self._logger.info(f"[Reconstruct @ {step}] Saved full-frame reconstruction to {out_path}")
+                except Exception as e:
+                    self._logger.warning(f"[Reconstruct @ {step}] Failed to save reconstruction: {e}")
         
         # Model checkpoint callback - step-based saving (DDPM standard)
         checkpoint_callback = ModelCheckpoint(
@@ -828,26 +1003,49 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         # Always print end-of-epoch train/val losses
         callbacks.append(EpochMetricsPrinter(logger))
         
-        # Setup Lightning trainer with performance optimizations
+        # Setup Lightning trainer with performance optimizations (multi-GPU aware)
+        hw_cfg = getattr(cfg, 'hardware', {})
+        accelerator_arg = hw_cfg.get('accelerator', 'gpu' if device == 'cuda' else 'cpu')
+        devices_arg = int(hw_cfg.get('devices', 1))
+        strategy_arg = hw_cfg.get('strategy', 'auto')
+        sync_bn = bool(hw_cfg.get('sync_batchnorm', False))
+
         trainer = pl.Trainer(
             max_epochs=max_epochs,
-            accelerator='gpu' if device == 'cuda' else 'cpu',
-            devices=1,  # Single GPU for now
+            max_steps=(int(getattr(cfg.training, 'max_steps', 0)) if int(getattr(cfg.training, 'max_steps', 0)) > 0 else None),
+            accelerator=accelerator_arg,
+            devices=devices_arg,
             precision='16-mixed' if use_amp else '32-true',
-            callbacks=callbacks,
-            logger=wandb_logger,
+            check_val_every_n_epoch=None,  # Use step-based validation across total training steps
+            callbacks=callbacks + [
+                PeriodicStepMetricsLogger(logger, step_interval=int(getattr(cfg.training, 'metrics_log_steps', 5000))),
+                PeriodicFullFrameReconstructionSaver(
+                    file_logger=logger,
+                    outputs_path=outputs_dir,
+                    data_root=data_dir,
+                    cfg=cfg,
+                    step_interval=int(getattr(cfg.training, 'reconstruction_save_steps', 10000))
+                ),
+            ],
+            logger=[l for l in [wandb_logger, csv_logger] if l is not None],
             gradient_clip_val=grad_clip_val,
             accumulate_grad_batches=int(cfg.training.get('accumulate_grad_batches', 1)),
             log_every_n_steps=int(cfg.training.get('log_every_n_steps', 100)),
-            val_check_interval=cfg.training.get('val_check_interval', 1.0),  # Validate at end of epoch (1.0) or every N steps
+            # Run validation every fixed number of training steps (int) or epoch fraction (float)
+            val_check_interval=(
+                int(cfg.training.get('val_check_interval', cfg.training.get('val_check_interval_steps', 5000)))
+                if isinstance(cfg.training.get('val_check_interval', None), int)
+                else float(cfg.training.get('val_check_interval', 1.0))
+            ),
             limit_val_batches=float(cfg.training.get('limit_val_batches', 1.0)),  # Limit validation batches for speed
             enable_progress_bar=True,
             enable_model_summary=False,  # Disable for speed
             deterministic=False,  # For performance
             benchmark=True,  # Enable cuDNN benchmarking
             inference_mode=False,  # Keep gradients for validation
-            sync_batchnorm=False,  # Not needed for single GPU
+            sync_batchnorm=sync_bn,
             num_sanity_val_steps=0,  # Skip sanity check for faster startup
+            strategy=strategy_arg,
         )
         
         # Train the model
@@ -868,7 +1066,16 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         
         logger.info(f"Lightning training completed!")
         logger.info(f"Best model path: {checkpoint_callback.best_model_path}")
-        logger.info(f"Best model score: {checkpoint_callback.best_model_score:.6f}")
+        try:
+            best_score_val = (
+                float(checkpoint_callback.best_model_score)
+                if checkpoint_callback.best_model_score is not None else None
+            )
+        except Exception:
+            best_score_val = None
+        logger.info(
+            f"Best model score: {best_score_val:.6f}" if best_score_val is not None else "Best model score: None"
+        )
         
     else:
         # Fallback to manual training loop if Lightning is not available
@@ -1321,6 +1528,9 @@ def run_evaluation(cfg: DictConfig, args) -> Dict[str, Dict[str, float]]:
                 psf_obj = PSF(psf_array=psf_array)
                 psf = psf_obj.psf
     
+    # Import centralized metrics once
+    from pkl_dg.metrics import compute_standard_metrics as compute_evaluation_metrics
+
     # Process each image
     for img_path in tqdm(image_paths, desc="Evaluating"):
         # Load input and ground truth

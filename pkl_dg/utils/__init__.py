@@ -53,6 +53,7 @@ try:
         load_16bit_image,
         normalize_16bit_to_model_input, 
         denormalize_model_output_to_16bit,
+        convert_8bit_to_16bit_equivalent,
         UINT16_MAX,
         UINT16_MIN,
         # Adaptive normalization classes
@@ -95,7 +96,27 @@ except ImportError:
         normalized = (image + 1.0) / 2.0
         return (normalized * UINT16_MAX).astype(np.float32)
 
-# Note: robust_normalize_16bit was removed as per requirements (no percentile normalization)
+    def convert_8bit_to_16bit_equivalent(x):
+        """Fallback 8-bit to 16-bit scaling if utils_16bit is unavailable."""
+        import numpy as np
+        if x is None:
+            return None
+        return np.clip(x.astype(np.float32) * (UINT16_MAX / 255.0), UINT16_MIN, UINT16_MAX).astype(np.float32)
+
+    # Backward-compatibility: robust_normalize_16bit was removed; alias to new normalization
+    def robust_normalize_16bit(image):
+        """Compatibility shim: use proper 16-bit normalization to [-1, 1]."""
+        return normalize_16bit_to_model_input(image)
+
+# Ensure backward-compatibility alias exists even when utils_16bit import succeeds
+try:
+    robust_normalize_16bit  # type: ignore[name-defined]
+except NameError:
+    def robust_normalize_16bit(image):  # type: ignore[no-redef]
+        """Compatibility shim: use proper 16-bit normalization to [-1, 1]."""
+        return normalize_16bit_to_model_input(image)
+
+# Note: robust_normalize_16bit was removed as per requirements (no percentile normalization); kept as alias for legacy code
 
 from .visualization import (
     linear_interpolation,
@@ -159,6 +180,7 @@ __all__ = [
     "robust_normalize_16bit",
     "normalize_16bit_to_model_input",
     "denormalize_model_output_to_16bit",
+    "convert_8bit_to_16bit_equivalent",
     # Adaptive normalization
     "NormalizationParams",
     "AdaptiveNormalizer",
