@@ -26,7 +26,7 @@ paths:
 wandb:
   project: pkl-diffusion-microscopy
   entity: anna_yoon-uc-berkeley  # Auto-configured from system credentials
-  mode: online  # online, offline, disabled
+  mode: offline  # Default to offline for HPC clusters
 
 # Model configuration - Optimized for 256x256 microscopy images
 model:

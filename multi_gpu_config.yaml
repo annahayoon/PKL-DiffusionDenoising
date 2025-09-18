@@ -29,7 +29,7 @@ paths:
 wandb:
   project: pkl-diffusion-microscopy
   entity: anna_yoon-uc-berkeley
-  mode: online
+  mode: offline  # Default to offline for HPC clusters
 
 # Model configuration - Full resolution with multi-GPU support
 model:
