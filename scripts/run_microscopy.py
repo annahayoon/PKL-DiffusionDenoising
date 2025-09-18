@@ -369,17 +369,39 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         print("✅ Using Zarr datasets")
     elif use_self_supervised:
         # Use true self-supervised learning with forward model
-        from pkl_dg.data.self_supervised import create_self_supervised_datasets
+        # Check for paired directory structure first
+        wf_dir = data_dir / "wf" 
+        twop_dir = data_dir / "2p"
+        
+        if not wf_dir.exists() or not twop_dir.exists():
+            raise ValueError(f"For self-supervised learning, both 'wf' and '2p' directories must exist in {data_dir}")
         
         # Check if we should use paired data for comparison
         use_paired = bool(getattr(cfg.data, "use_paired_for_validation", False))
+        use_forward_model = not use_paired  # Use forward model unless explicitly using paired data
         
-        train_dataset, val_dataset = create_self_supervised_datasets(
-            data_dir=data_dir,
-            forward_model=forward_model,
+        train_dataset = UnpairedDataset(
+            wf_dir=str(wf_dir),
+            twop_dir=str(twop_dir),
             transform=transform,
             image_size=int(cfg.data.image_size),
-            use_paired=use_paired
+            mode="train",
+            forward_model=forward_model,
+            use_forward_model=use_forward_model,
+            add_noise=True,
+            noise_level=0.05
+        )
+        
+        val_dataset = UnpairedDataset(
+            wf_dir=str(wf_dir),
+            twop_dir=str(twop_dir),
+            transform=transform,
+            image_size=int(cfg.data.image_size),
+            mode="val",
+            forward_model=forward_model,
+            use_forward_model=use_forward_model,
+            add_noise=False,  # No noise during validation
+            noise_level=0.0
         )
         
         if use_paired:
