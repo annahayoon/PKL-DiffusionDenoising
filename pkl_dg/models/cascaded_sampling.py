@@ -41,9 +41,6 @@ class CascadedSampler:
         upsampling_method: str = "bilinear",
         enable_cross_attention: bool = True,
         memory_efficient: bool = True,
-        # Legacy API support
-        models: Optional[Dict[int, nn.Module]] = None,
-        resolutions: Optional[List[int]] = None,
         num_inference_steps: int = 50,
         device: Optional[str] = None,
     ):
@@ -59,21 +56,10 @@ class CascadedSampler:
             enable_cross_attention: Enable cross-resolution attention
             memory_efficient: Use memory-efficient processing
         """
-        # Handle legacy API
-        if models is not None and resolutions is not None:
-            self.models = models
-            self.resolution_schedule = sorted(resolutions)
-            self.model = None
-            self.legacy_api = True
-            self.num_inference_steps = num_inference_steps
-            self.device = device
-        else:
-            self.model = model
-            self.models = None
-            self.resolution_schedule = sorted(resolution_schedule)
-            self.legacy_api = False
-            self.num_inference_steps = num_inference_steps
-            self.device = device
+        self.model = model
+        self.resolution_schedule = sorted(resolution_schedule)
+        self.num_inference_steps = num_inference_steps
+        self.device = device
             
         self.base_sampler = base_sampler
         self.consistency_weight = consistency_weight
@@ -160,9 +146,7 @@ class CascadedSampler:
             Final generated sample or dict with intermediates
         """
         if device is None:
-            if self.legacy_api and self.device:
-                device = self.device
-            elif self.model is not None:
+            if self.model is not None:
                 device = next(self.model.parameters()).device
             else:
                 device = 'cpu'
@@ -522,71 +506,6 @@ class CascadedSampler:
         except Exception as e:
             print(f"⚠️ Failed to save intermediate at stage {stage}: {e}")
 
-    def sample(self, batch_size: int = 1, verbose: bool = True):
-        """Legacy API sample method for backward compatibility."""
-        if not self.legacy_api:
-            raise ValueError("Use sample_cascaded() for new API")
-            
-        # Use the highest resolution as target
-        target_resolution = max(self.resolution_schedule)
-        
-        # Simple cascaded generation using legacy models
-        device = self.device or 'cpu'
-        current_sample = None
-        
-        for i, resolution in enumerate(self.resolution_schedule):
-            if verbose:
-                print(f"   Generating at {resolution}x{resolution}...")
-            
-            model = self.models.get(resolution)
-            if model is None:
-                continue
-                
-            if current_sample is None:
-                # First resolution: generate from noise
-                current_sample = torch.randn(batch_size, 1, resolution, resolution)
-                if device != 'cpu':
-                    current_sample = current_sample.to(device)
-                
-                # Use the model to denoise
-                with torch.no_grad():
-                    if hasattr(model, 'ddpm_sample'):
-                        current_sample = model.ddpm_sample(batch_size, (1, resolution, resolution))
-                    elif hasattr(model, 'sample_with_scheduler'):
-                        current_sample = model.sample_with_scheduler(
-                            shape=(batch_size, 1, resolution, resolution),
-                            num_inference_steps=self.num_inference_steps,
-                            device=device
-                        )
-                    else:
-                        # Fallback: just return the noise (for testing)
-                        pass
-            else:
-                # Upsample from previous resolution
-                upsampled = F.interpolate(
-                    current_sample, 
-                    size=(resolution, resolution),
-                    mode=self.upsampling_method,
-                    align_corners=False if self.upsampling_method == 'bilinear' else None
-                )
-                
-                # Add some noise and refine
-                noise_level = self.noise_injection_schedule[i] if i < len(self.noise_injection_schedule) else 0.1
-                noisy_upsampled = upsampled + noise_level * torch.randn_like(upsampled)
-                
-                # Use the model to refine
-                with torch.no_grad():
-                    if hasattr(model, 'sample_with_scheduler'):
-                        current_sample = model.sample_with_scheduler(
-                            shape=noisy_upsampled.shape,
-                            num_inference_steps=self.num_inference_steps,
-                            device=device
-                        )
-                    else:
-                        # Fallback: use the upsampled version
-                        current_sample = upsampled
-        
-        return current_sample
 
 
 class HierarchicalCascadedSampler(CascadedSampler):

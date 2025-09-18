@@ -41,11 +41,11 @@ def test_normalization_comparison():
     print(f"Sample WF image range: [{wf_img.min():.0f}, {wf_img.max():.0f}]")
     print(f"Sample 2P image range: [{tp_img.min():.0f}, {tp_img.max():.0f}]")
     
-    # OLD 16-bit normalization
+    # 16-bit normalization
     wf_old_norm = normalize_16bit_to_model_input(wf_img)
     tp_old_norm = normalize_16bit_to_model_input(tp_img)
     
-    print(f"\nOLD 16-bit normalization:")
+    print(f"\n16-bit normalization:")
     print(f"  WF: [{wf_old_norm.min():.3f}, {wf_old_norm.max():.3f}] (range: {wf_old_norm.max() - wf_old_norm.min():.3f})")
     print(f"  2P: [{tp_old_norm.min():.3f}, {tp_old_norm.max():.3f}] (range: {tp_old_norm.max() - tp_old_norm.min():.3f})")
     
@@ -134,7 +134,7 @@ def show_improvement_summary():
     
     print(f"\n=== IMPROVEMENT SUMMARY ===")
     
-    # Load old analysis results
+    # Load previous analysis results
     from pkl_dg.utils.utils_16bit import analyze_current_normalization_issues
     
     print("Before adaptive normalization:")

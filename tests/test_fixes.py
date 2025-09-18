@@ -29,7 +29,7 @@ def test_cascaded_sampling_api_fix():
         from pkl_dg.models.cascaded_sampling import CascadedSampler
         from pkl_dg.models.diffusion import DDPMTrainer
         
-        # Create test models using legacy API
+        # Create test models
         models = {}
         resolutions = [64, 128]
         
@@ -45,7 +45,7 @@ def test_cascaded_sampling_api_fix():
             trainer = DDPMTrainer(base_unet, config)
             models[res] = trainer
         
-        # Test legacy API
+        # Test API
         sampler = CascadedSampler(
             models=models,
             resolutions=resolutions,
@@ -53,7 +53,7 @@ def test_cascaded_sampling_api_fix():
             device='cpu'
         )
         
-        print("✅ CascadedSampler legacy API initialization successful")
+        print("✅ CascadedSampler initialization successful")
         
         # Test sampling
         with torch.no_grad():

@@ -51,55 +51,6 @@ def compute_standard_metrics(
         }
 
 
-def compute_evaluation_metrics(pred: np.ndarray, gt: np.ndarray) -> Dict[str, float]:
-    """Compute evaluation metrics between prediction and ground truth.
-    
-    Legacy wrapper for backward compatibility with run_microscopy.py
-    """
-    return compute_standard_metrics(pred, gt, data_range=1.0)
-
-
-def compute_metrics(
-    pred: np.ndarray, 
-    target: np.ndarray, 
-    metric_names: Optional[List[str]] = None,
-    data_range: Optional[float] = None
-) -> Dict[str, float]:
-    """Compute specified metrics between predicted and target images.
-    
-    Legacy wrapper for backward compatibility with evaluation.py
-    
-    Args:
-        pred: Predicted image
-        target: Target image  
-        metric_names: List of metric names to compute. If None, computes all.
-        data_range: Dynamic range of the images
-        
-    Returns:
-        Dictionary with requested metrics
-    """
-    all_metrics = compute_standard_metrics(pred, target, data_range=data_range)
-    
-    if metric_names is None:
-        return all_metrics
-    
-    return {name: all_metrics[name] for name in metric_names if name in all_metrics}
-
-
-def compute_baseline_metrics(
-    pred: np.ndarray, 
-    target: np.ndarray,
-    data_range: Optional[float] = None
-) -> Dict[str, float]:
-    """Compute metrics for baseline methods.
-    
-    Legacy wrapper for backward compatibility with baseline.py
-    Uses automatic data range calculation like the original baseline implementation.
-    """
-    if data_range is None:
-        data_range = float(target.max() - target.min()) if target.size > 0 else 1.0
-    
-    return compute_standard_metrics(pred, target, data_range=data_range)
 
 
 def evaluate_model_performance(

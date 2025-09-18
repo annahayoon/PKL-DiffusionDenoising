@@ -449,7 +449,7 @@ class TestTrainingPipeline(E2EPipelineTestBase):
             # Create modified config
             test_config = minimal_config.copy()
             for key, value in config_override.items():
-                # Use direct assignment instead of deprecated OmegaConf.set
+                # Use direct assignment
                 if '.' in key:
                     # Handle nested keys like 'model.channels'
                     keys = key.split('.')

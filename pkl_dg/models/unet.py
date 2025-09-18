@@ -19,12 +19,6 @@ from .nn import (
 )
 
 
-# Legacy alias for backward compatibility
-resnet_block = ResNetBlock
-
-
-# Legacy alias for backward compatibility
-attention_block = SelfAttention2D
 
 
 class UNet(nn.Module):

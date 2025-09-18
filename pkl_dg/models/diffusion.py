@@ -440,7 +440,7 @@ class DDPMTrainer(LightningModuleBase):
         elif major >= 7:  # Volta and Turing
             return torch.float16
         else:
-            return torch.float32  # Older GPUs don't support mixed precision well
+            return torch.float32  # Fallback for GPUs without mixed precision support
 
     # ===== Helper conversions between model and intensity domains =====
     @staticmethod
@@ -1528,8 +1528,6 @@ class DDPMTrainer(LightningModuleBase):
             )
 
 
-# Legacy compatibility - keep SelfSupervisedDDPMTrainer as alias
-SelfSupervisedDDPMTrainer = DDPMTrainer
 
 
 # ===== 16-bit Output Utilities (moved to utils.image_processing) =====

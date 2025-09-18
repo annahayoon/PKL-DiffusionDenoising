@@ -131,7 +131,7 @@ class CheckpointManager:
                 best_path = self.checkpoint_dir / "best_model.pt"
                 shutil.copy2(checkpoint_path, best_path)
                 
-        # Cleanup old checkpoints
+        # Cleanup checkpoints
         self._cleanup_checkpoints()
         
         return checkpoint_path
@@ -174,7 +174,7 @@ class CheckpointManager:
         return None
     
     def _cleanup_checkpoints(self):
-        """Remove old checkpoints beyond max_checkpoints."""
+        """Remove checkpoints beyond max_checkpoints."""
         if len(self.checkpoint_history) > self.max_checkpoints:
             # Sort by modification time
             self.checkpoint_history.sort(key=lambda x: x.stat().st_mtime)

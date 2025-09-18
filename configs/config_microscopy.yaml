@@ -55,11 +55,11 @@ model:
       enabled: true                 # Use ProgressiveTrainer class
       max_resolution: 128           # Maximum resolution
       curriculum_type: "exponential" # linear, exponential, adaptive
-      epochs_per_resolution: [30, 40, 50, 80]  # Progressive epochs: 32→64→96→128
+      steps_per_resolution: [200000, 250000, 300000, 250000]  # Progressive steps: 32→64→96→128 (1M total)
       
       # Smooth transitions
       smooth_transitions: true      # Alpha-blending between resolutions
-      transition_epochs: 3          # Epochs for smooth transitions
+      transition_steps: 5000        # 5K steps for smooth transitions between resolutions
       blend_mode: "alpha"           # alpha, feature, loss
       
       # Adaptive features
@@ -70,23 +70,25 @@ model:
 
 # Training configuration - Optimized for self-supervised microscopy learning
 training:
-  # Core training parameters
-  max_epochs: 1000              # Maximum training epochs (will stop early if converged)
+  # Core training parameters - STEP-BASED TRAINING
+  max_steps: 1000000            # 1 Million steps (much better for diffusion models)
+  max_epochs: -1                # Disable epoch limit (step-based training)
   num_timesteps: 1000           # Diffusion timesteps (1000 is optimal for quality)
   beta_schedule: cosine         # cosine schedule works better than linear
   learning_rate: 1.0e-4         # Stable learning rate for diffusion models
   weight_decay: 1.0e-6          # L2 regularization
   
-  # Batch and memory settings - Optimized for single A40 GPU
-  batch_size: 32                # Per GPU batch size (good for A40)
-  num_workers: 16               # Workers for single GPU (adjust based on CPU cores)
-  accumulate_grad_batches: 4    # Effective batch size = 32 * 4 = 128 (optimal for single A40)
+  # Batch and memory settings - MAXIMIZED for A40 (46GB VRAM) + 72 CPU cores
+  batch_size: 64                # INCREASED: Max batch size for A40 with 128x128 images
+  num_workers: 32               # OPTIMIZED: Use 32 workers (72 cores available, leave headroom)
+  accumulate_grad_batches: 2    # REDUCED: Effective batch = 64 * 2 = 128 (same effective size, faster)
   gradient_clip: 1.0            # Gradient clipping for stability
   
-  # Memory optimization - Tuned for A40 (46GB VRAM)
+  # Memory optimization - MAXIMIZED for A40 (46GB VRAM) + high-core CPU
   persistent_workers: true      # Keep workers alive between epochs
-  prefetch_factor: 8            # Increased prefetch for high-core CPU
+  prefetch_factor: 16           # INCREASED: High prefetch for 72-core CPU (more aggressive)
   pin_memory: true              # Pin memory for faster GPU transfer
+  drop_last: false              # Use all data samples
   
   # GPU Memory scaling guide for 128x128 images (proven values):
   # - A40/A100 (40-80GB): batch_size: 32 + accumulate_grad_batches: 3 (current, proven)
@@ -100,17 +102,65 @@ training:
   use_conditioning: false       # Disable WF conditioning for pure self-supervised learning
   conditioning_type: none       # No conditioning for grayscale microscopy
   
-  # Learning rate scheduling and early stopping
+  # ADAPTIVE LEARNING RATE SCHEDULING - Optimized for progressive training
   use_scheduler: true           # Enable adaptive learning rate
-  scheduler_type: cosine        # Cosine annealing scheduler
+  scheduler_type: "improved_cosine"  # Advanced cosine with restarts
   scheduler_warmup_steps: 1000  # Warmup steps for learning rate
   
-  # Early stopping configuration
-  early_stopping_patience: 25  # Stop if no improvement for 25 epochs
-  early_stopping_min_delta: 1e-5  # Minimum change to qualify as improvement
-  early_stopping_monitor: val_loss  # Metric to monitor
+  # Advanced scheduler configuration
+  advanced_schedulers:
+    enabled: true               # Use SchedulerManager for dynamic switching
+    primary_scheduler: "improved_cosine"
+    scheduler_params:
+      T_max: 50000             # Cosine period (50K steps) - matches resolution phases
+      eta_min: 1e-6            # Minimum learning rate
+      T_mult: 2                # Period multiplier for restarts
+      restart_decay: 0.8       # Decay factor after each restart
+    
+    # Alternative schedulers for dynamic switching
+    alternatives:
+      - name: "exponential"
+        type: "exponential"
+        params:
+          decay_rate: 0.96
+      - name: "adaptive"
+        type: "adaptive"
+        params:
+          adaptation_rate: 0.01
+          patience: 10
+          factor: 0.5
   
-  # Self-supervised learning specific parameters
+  # EARLY STOPPING - Step-based for 1M step training
+  early_stopping_patience: 50000  # 50K steps patience (equivalent to ~190 epochs)
+  early_stopping_min_delta: 1e-6  # Sensitive to small improvements
+  early_stopping_monitor: val_loss  # Metric to monitor
+  early_stopping_mode: "min"   # Monitor for minimum loss
+  early_stopping_verbose: true # Log early stopping decisions
+  
+  # DUAL OBJECTIVE TRAINING - Default enabled for spatial + intensity optimization
+  use_dual_objective_loss: true # Enable dual objective loss (spatial resolution + pixel intensity)
+  
+  # Dual objective loss configuration
+  dual_objective_loss:
+    # Loss component weights (adaptive during training)
+    alpha_diffusion: 1.0        # Weight for diffusion loss (spatial structure)
+    beta_intensity: 0.6         # Weight for intensity mapping loss (pixel accuracy)
+    gamma_perceptual: 0.2       # Weight for perceptual loss (spatial quality)
+    delta_gradient: 0.4         # Weight for gradient loss (edge sharpness)
+    
+    # Loss configurations
+    intensity_loss_type: "mse"  # mse, l1, smooth_l1
+    gradient_loss_type: "l1"    # l1, l2, smooth_l1
+    intensity_weight_mode: "adaptive"  # adaptive, fixed
+    
+    # Adaptive weighting (gradually increase intensity focus)
+    use_adaptive_weighting: true
+    warmup_steps: 1000          # Steps to reach full intensity weight
+    
+    # Optional perceptual loss
+    use_perceptual_loss: true
+    perceptual_layers: ["relu2_2", "relu3_3", "relu4_3"]
+  
   supervised_x0_weight: 0.0     # Disabled for pure self-supervised learning
   ddpm_loss_weight: 1.0         # Weight for standard DDPM loss
   cycle_loss_weight: 0.15       # Weight for cycle consistency loss (slightly higher)
@@ -118,13 +168,44 @@ training:
   cycle_loss_type: smooth_l1    # smooth_l1, l1, or l2 (smooth_l1 is more robust)
   use_perceptual_loss: true     # Enable perceptual loss for better quality
   
-  # Training validation and checkpointing
-  val_check_interval: 1.0       # Validate every epoch
-  save_every_n_epochs: 10       # Save checkpoint every 10 epochs
+  # STEP-BASED validation and checkpointing
+  val_check_interval: 500       # Validate every 500 steps (must be ≤ 525 batches per epoch)
+  save_every_n_steps: 10000     # Save checkpoint every 10000 steps
   log_every_n_steps: 100        # Log metrics every 100 steps
+  
+  # COMPREHENSIVE MODEL SAVING STRATEGY
+  checkpoint_every_n_steps: [5000, 10000]  # Multiple checkpoint intervals
+  save_intermediate_checkpoints: true      # Save at both intervals
+  
+  # Advanced checkpoint configuration
+  checkpoint_config:
+    # Main checkpoints (every 10K steps)
+    main_checkpoint:
+      every_n_train_steps: 10000    # Main checkpoint frequency
+      save_top_k: 5                 # Keep best 5 models
+      monitor: "val/loss"           # Monitor validation loss
+      mode: "min"                   # Save minimum loss
+      filename: "ddpm-{step:06d}-{val/loss:.4f}"
+      save_last: true               # Always save latest
+      
+    # Intermediate checkpoints (every 5K steps) 
+    intermediate_checkpoint:
+      every_n_train_steps: 5000     # Recovery checkpoint frequency
+      save_top_k: -1                # Save all intermediate checkpoints
+      filename: "ddmp-intermediate-{step:06d}"
+      save_last: false              # Don't duplicate latest
+      
+    # Progressive resolution checkpoints
+    resolution_checkpoints: true    # Save at each resolution transition
+    save_best_per_resolution: true  # Best model for each resolution phase
   
   # Advanced training options
   steps_per_epoch: 263          # Corrected: 33,635 samples ÷ 128 effective batch size = 263 steps/epoch
+  
+  # PERFORMANCE OPTIMIZATIONS - Maximize A40 utilization
+  compile_model: true           # PyTorch 2.0 compilation for 15-20% speedup
+  use_fused_adam: true          # Fused AdamW optimizer for speed
+  dataloader_pin_memory_device: "cuda"  # Pin directly to GPU
   precision: 16-mixed           # Mixed precision training
   
 # Data configuration - 128x128 patches with 16-bit support
@@ -224,19 +305,52 @@ logging:
   save_top_k: 3                 # Keep top K checkpoints
   monitor_metric: val_loss      # Metric to monitor for best checkpoint
   
-# Memory and performance optimization
+# Memory and performance optimization - MAXIMIZED for A40
 optimization:
-  compile_model: false          # PyTorch 2.0 model compilation (experimental)
-  channels_last: false          # Use channels last memory format
+  compile_model: true           # PyTorch 2.0 model compilation (15-20% speedup)
+  channels_last: true           # Use channels last memory format (better A40 performance)
   benchmark_cudnn: true         # Enable cuDNN benchmarking
-  deterministic: false          # Deterministic training (slower but reproducible)
+  deterministic: false          # Non-deterministic for maximum speed
   
-# Data augmentation (optional)
+  # Advanced memory optimization for A40
+  memory_efficient_attention: true    # Use memory efficient attention
+  gradient_checkpointing: true        # ENABLED: Trade compute for memory (allows larger batches)
+  use_gradient_checkpointing: true    # Enable gradient checkpointing in training
+  use_tf32: true                      # Enable TF32 on A40 for speed
+  torch_compile_mode: "max-autotune"  # Maximum optimization
+  
+# MICROSCOPY-SPECIFIC DATA AUGMENTATION - Optimized for dual objectives
 augmentation:
-  enabled: false                # Enable data augmentation
-  horizontal_flip: 0.5          # Probability of horizontal flip
-  vertical_flip: 0.5            # Probability of vertical flip
-  rotation: 0.1                 # Maximum rotation angle (fraction of 2π)
+  enabled: true                 # ENABLED: Essential for robust microscopy training
+  
+  # Geometric augmentations (microscopy-safe)
+  horizontal_flip: 0.5          # Safe for microscopy (no directional bias)
+  vertical_flip: 0.5            # Safe for microscopy
+  rotation: 0.1                 # Small rotations (preserve microscopy structures)
+  
+  # Advanced microscopy augmentations
+  random_crop: true             # Random cropping with scale
+  crop_scale: [0.9, 1.0]        # Conservative cropping (preserve structures)
+  elastic_transform: true       # Excellent for biological images
+  elastic_alpha: 20.0           # Moderate deformation (preserve biology)
+  elastic_sigma: 3.0            # Smooth deformation
+  
+  # INTENSITY AUGMENTATIONS - Critical for dual objective training
+  intensity_augmentation:
+    enabled: true               # Essential for intensity mapping
+    brightness: 0.05            # Subtle brightness changes (preserve signal)
+    contrast: 0.05              # Subtle contrast changes
+    gamma: [0.95, 1.05]         # Small gamma corrections
+    
+    # Microscopy-specific intensity augmentation
+    intensity_scale_range: [0.98, 1.02]  # Preserve signal relationships
+    noise_injection: true       # Add small noise to increase variation
+    noise_std: 0.01             # Small noise (increase 2P variation)
+    poisson_noise: true         # Microscopy-appropriate noise model
+  
+  # Quality control
+  augment_probability: 0.8      # High probability for robust training
+  preserve_intensity_mapping: true  # Critical for dual objectives
   
 # Resume training (optional)
 # resume_checkpoint: null       # Path to checkpoint to resume from

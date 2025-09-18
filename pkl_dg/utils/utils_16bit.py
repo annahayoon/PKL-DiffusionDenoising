@@ -6,8 +6,8 @@ implementations. Uses tifffile for loading and PyTorch-style normalization math.
 
 Key functions:
 - load_16bit_image(): Load 16-bit images using tifffile
-- normalize_16bit_to_model_input(): Convert [0, 65535] to [-1, 1] (legacy)
-- denormalize_model_output_to_16bit(): Convert [-1, 1] to [0, 65535] (legacy)
+- normalize_16bit_to_model_input(): Convert [0, 65535] to [-1, 1]
+- denormalize_model_output_to_16bit(): Convert [-1, 1] to [0, 65535]
 - AdaptiveNormalizer: Data-driven normalization for better DDPM training
 - NormalizationParams: Parameters for adaptive normalization with exact inverse transforms
 """
@@ -181,7 +181,7 @@ class AdaptiveNormalizer:
 
 
 # =============================================================================
-# Legacy 16-bit Normalization Functions
+# 16-bit Normalization Functions
 # =============================================================================
 
 def load_16bit_image(path: Union[str, Path]) -> Optional[np.ndarray]:
@@ -765,7 +765,7 @@ __all__ = [
     'create_normalization_params_from_metadata',
     'analyze_current_normalization_issues',
     
-    # Legacy 16-bit functions
+    # 16-bit functions
     'load_16bit_image',
     'normalize_16bit_to_model_input',
     'denormalize_model_output_to_16bit',

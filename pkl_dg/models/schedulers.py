@@ -650,7 +650,6 @@ class ConsistencyTrainingScheduler(BaseScheduler):
         return torch.clamp(timesteps, 0, self.num_timesteps - 1)
 
 
-# Legacy SchedulerManager removed - use SCHEDULER_REGISTRY instead
 
 
 # Modern registry-based factory function

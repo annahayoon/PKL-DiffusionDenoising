@@ -101,7 +101,7 @@ This document summarizes the comprehensive enhancements made to the PKL Diffusio
   ```
   scripts/
   ├── training/
-  │   └── (legacy train_* scripts removed - functionality moved to run_* scripts)
+  │   └── (train_* scripts functionality moved to run_* scripts)
   ├── evaluation/
   │   ├── evaluate.py
   │   ├── compare_all_methods.py
@@ -198,7 +198,7 @@ All existing functionality has been preserved:
 - Existing scripts remain functional
 - Configuration formats unchanged
 - API compatibility maintained
-- Legacy microscopy utilities available
+- Microscopy utilities available
 
 ## 📊 Comparison with Original Repository
 

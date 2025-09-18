@@ -1,9 +1,14 @@
 """
 Dual-Objective Loss for Spatial Resolution and Pixel Intensity Prediction
 
-This module implements a multi-component loss function optimized for:
+This module implements a comprehensive dual-objective training system optimized for:
 1. Spatial resolution (sharpness) enhancement
 2. Pixel intensity (signal mapping) prediction
+
+Components:
+- DualObjectiveLoss: Multi-component loss function combining diffusion, intensity, gradient, and perceptual losses
+- IntensityAugmentation: Specialized data augmentation for intensity mapping with limited 2P dynamic range
+- Configuration utilities: Functions to create optimized training configurations and progressive training strategies
 
 The loss combines:
 - Diffusion Loss: Standard DDPM loss for spatial structure learning
@@ -15,7 +20,7 @@ The loss combines:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional, Union
+from typing import Dict, Tuple, Optional, Union, Any
 
 
 class GradientLoss(nn.Module):
@@ -325,6 +330,47 @@ class DualObjectiveLoss(nn.Module):
         self.current_step = step
 
 
+class IntensityAugmentation:
+    """
+    Data augmentation specifically designed to improve intensity mapping
+    with limited 2P dynamic range.
+    """
+    
+    def __init__(
+        self,
+        intensity_scale_range: Tuple[float, float] = (0.95, 1.05),
+        noise_std: float = 0.01,
+        contrast_range: Tuple[float, float] = (0.98, 1.02)
+    ):
+        self.intensity_scale_range = intensity_scale_range
+        self.noise_std = noise_std
+        self.contrast_range = contrast_range
+        
+    def __call__(self, wf: torch.Tensor, tp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply intensity-focused augmentations."""
+        
+        # 1. Intensity scaling (subtle to preserve signal mapping)
+        scale_min, scale_max = self.intensity_scale_range
+        scale = torch.rand(1).item() * (scale_max - scale_min) + scale_min
+        tp_aug = tp * scale
+        
+        # 2. Add small amount of noise to increase variation
+        if self.noise_std > 0:
+            noise = torch.randn_like(tp) * self.noise_std
+            tp_aug = tp_aug + noise
+        
+        # 3. Contrast adjustment (very subtle)
+        contrast_min, contrast_max = self.contrast_range
+        contrast = torch.rand(1).item() * (contrast_max - contrast_min) + contrast_min
+        tp_mean = tp_aug.mean()
+        tp_aug = (tp_aug - tp_mean) * contrast + tp_mean
+        
+        # 4. Clamp to valid range
+        tp_aug = torch.clamp(tp_aug, -1, 1)
+        
+        return wf, tp_aug
+
+
 def create_dual_objective_loss(config: Dict) -> DualObjectiveLoss:
     """
     Factory function to create dual objective loss from configuration.
@@ -349,3 +395,116 @@ def create_dual_objective_loss(config: Dict) -> DualObjectiveLoss:
         warmup_steps=loss_config.get('warmup_steps', 1000),
         use_perceptual_loss=loss_config.get('use_perceptual_loss', False)
     )
+
+
+def create_dual_objective_training_config() -> Dict[str, Any]:
+    """Create optimized training configuration for dual objectives."""
+    
+    config = {
+        # Model configuration
+        'model': {
+            'unet_channels': [64, 128, 256, 512],  # Sufficient capacity
+            'attention_resolutions': [16, 8],      # Focus on fine details
+            'num_res_blocks': 2,
+            'dropout': 0.1
+        },
+        
+        # Training configuration
+        'training': {
+            'batch_size': 8,                       # Stable for limited range data
+            'learning_rate': 1e-4,                 # Conservative for intensity mapping
+            'lr_schedule': 'cosine_with_restarts', # Helps escape local minima
+            'max_epochs': 200,                     # Longer training for limited data
+            'warmup_steps': 1000,                  # Gradual warmup
+            'gradient_clip_val': 1.0,              # Stability with limited range
+        },
+        
+        # Loss configuration
+        'loss': {
+            'alpha_diffusion': 1.0,    # Standard diffusion loss
+            'beta_intensity': 0.8,     # High weight for intensity mapping
+            'gamma_perceptual': 0.3,   # Spatial quality
+            'delta_gradient': 0.4,     # Edge preservation (important for sharpness)
+            'intensity_weight_schedule': 'adaptive'
+        },
+        
+        # Data augmentation
+        'augmentation': {
+            'use_intensity_aug': True,
+            'intensity_scale_range': (0.98, 1.02),  # Subtle for signal preservation
+            'noise_std': 0.005,                     # Small noise injection
+            'contrast_range': (0.99, 1.01)         # Very subtle contrast changes
+        },
+        
+        # Optimization strategies
+        'optimization': {
+            'use_ema': True,                       # Exponential moving average
+            'ema_decay': 0.9999,
+            'use_progressive_training': True,      # Start low-res, increase gradually
+            'progressive_schedule': [64, 96, 128], # Resolution progression
+            'curriculum_learning': True,           # Easy samples first
+        },
+        
+        # Monitoring and validation
+        'validation': {
+            'val_every_n_epochs': 5,
+            'metrics': [
+                'mse_loss',           # Intensity accuracy
+                'ssim',               # Spatial quality
+                'psnr',               # Overall quality
+                'gradient_magnitude', # Sharpness measure
+                'intensity_histogram_distance'  # Signal mapping accuracy
+            ]
+        }
+    }
+    
+    return config
+
+
+def create_progressive_training_strategy() -> Dict[str, Any]:
+    """
+    Progressive training strategy optimized for dual objectives.
+    """
+    
+    strategy = {
+        'phase_1': {
+            'name': 'Spatial Structure Learning',
+            'resolution': 64,
+            'epochs': 50,
+            'focus': 'Learn basic spatial structures with high diffusion weight',
+            'loss_weights': {
+                'alpha_diffusion': 1.0,
+                'beta_intensity': 0.2,
+                'gamma_perceptual': 0.5,
+                'delta_gradient': 0.1
+            }
+        },
+        
+        'phase_2': {
+            'name': 'Intensity Mapping Integration',
+            'resolution': 96,
+            'epochs': 75,
+            'focus': 'Balance spatial and intensity learning',
+            'loss_weights': {
+                'alpha_diffusion': 1.0,
+                'beta_intensity': 0.6,
+                'gamma_perceptual': 0.4,
+                'delta_gradient': 0.3
+            }
+        },
+        
+        'phase_3': {
+            'name': 'Fine-tuning and Sharpness',
+            'resolution': 128,
+            'epochs': 75,
+            'focus': 'Maximize sharpness and intensity accuracy',
+            'loss_weights': {
+                'alpha_diffusion': 1.0,
+                'beta_intensity': 0.8,
+                'gamma_perceptual': 0.3,
+                'delta_gradient': 0.5
+            }
+        }
+    }
+    
+    return strategy

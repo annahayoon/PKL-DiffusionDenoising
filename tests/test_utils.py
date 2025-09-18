@@ -52,7 +52,7 @@ def make_forward_model(device: str = "cpu", background: float = 0.0) -> Optional
     return ForwardModel(psf=psf, background=background, device=device)
 
 
-# For backward compatibility, create aliases with the old function names
+# For backward compatibility, create aliases
 _make_tiny_dataset = make_tiny_dataset
 _make_forward_model = make_forward_model
 

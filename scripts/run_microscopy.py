@@ -160,6 +160,9 @@ def setup_experiment(args, cfg: Optional[DictConfig] = None) -> DictConfig:
     # Override config with command line arguments
     if args.max_epochs is not None:
         cfg.training.max_epochs = args.max_epochs
+    if args.max_steps is not None:
+        cfg.training.max_steps = args.max_steps
+        cfg.training.max_epochs = -1  # Disable epoch limit when using steps
     if args.batch_size is not None:
         cfg.training.batch_size = args.batch_size
     if args.learning_rate is not None:
@@ -550,7 +553,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         else:
             print("✅ Using true self-supervised learning (forward model generates synthetic WF)")
     else:
-        # Check for unpaired directory structure (legacy)
+        # Check for unpaired directory structure
         wf_dir = data_dir / "wf"
         twop_dir = data_dir / "2p"
         
@@ -561,7 +564,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
             if use_forward_model:
                 print("✅ Using self-supervised learning with forward model")
             else:
-                print("✅ Using unpaired self-supervised learning (legacy)")
+                print("✅ Using unpaired self-supervised learning")
                 
             train_dataset = UnpairedDataset(
                 wf_dir=str(wf_dir),
@@ -776,7 +779,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
             gradient_clip_val=grad_clip_val,
             accumulate_grad_batches=int(cfg.training.get('accumulate_grad_batches', 1)),
             log_every_n_steps=int(cfg.training.get('log_every_n_steps', 100)),
-            val_check_interval=min(int(cfg.training.get('val_check_steps', 1000)), 1051),  # Validate every 1K steps, max 1051
+            val_check_interval=min(int(cfg.training.get('val_check_interval', 500)), 525),  # Validate every 500 steps, max 525 (batches per epoch)
             limit_val_batches=float(cfg.training.get('limit_val_batches', 1.0)),  # Limit validation batches for speed
             enable_progress_bar=True,
             enable_model_summary=False,  # Disable for speed
@@ -832,7 +835,7 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
                         with torch.amp.autocast('cuda', dtype=amp_dtype):
                             loss = ddpm_trainer.training_step(batch, batch_idx)
                     except Exception:
-                        # Older API: torch.cuda.amp.autocast (no device_type kw)
+                        # Fallback API: torch.cuda.amp.autocast (no device_type kw)
                         with autocast(dtype=amp_dtype):
                             loss = ddpm_trainer.training_step(batch, batch_idx)
                     
@@ -1095,7 +1098,7 @@ def load_model_and_sampler(cfg: DictConfig, checkpoint_path: str, guidance_type:
 
 
 # Import consolidated metrics function
-from pkl_dg.metrics import compute_evaluation_metrics
+    from pkl_dg.metrics import compute_standard_metrics as compute_evaluation_metrics
 
 
 def compute_baseline_metrics(wf_input: np.ndarray, gt: np.ndarray, psf: Optional[np.ndarray] = None) -> Dict[str, Dict[str, float]]:
@@ -1367,6 +1370,7 @@ def main():
     
     # Training arguments
     parser.add_argument('--max-epochs', type=int, help='Maximum training epochs')
+    parser.add_argument('--max-steps', type=int, help='Maximum training steps (overrides max-epochs)')
     parser.add_argument('--batch-size', type=int, help='Training batch size')
     parser.add_argument('--learning-rate', type=float, help='Learning rate')
     parser.add_argument('--device', type=str, help='Device (cuda/cpu/auto)')

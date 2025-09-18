@@ -55,6 +55,16 @@ from .losses import (
     create_loss_function,
 )
 
+# Import dual objective components
+from .dual_objective_loss import (
+    DualObjectiveLoss,
+    IntensityMappingLoss,
+    IntensityAugmentation,
+    create_dual_objective_loss,
+    create_dual_objective_training_config,
+    create_progressive_training_strategy,
+)
+
 from .schedulers import (
     BaseScheduler,
     LinearScheduler,
@@ -129,7 +139,6 @@ try:
 except ImportError:
     HIERARCHICAL_STRATEGIES_AVAILABLE = False
 
-# Legacy imports removed - use modern registry system instead
 
 __all__ = [
     # Core components
@@ -164,6 +173,14 @@ __all__ = [
     "GradientLoss",
     "CompositeLoss",
     "create_loss_function",
+    
+    # Dual objective components
+    "DualObjectiveLoss",
+    "IntensityMappingLoss", 
+    "IntensityAugmentation",
+    "create_dual_objective_loss",
+    "create_dual_objective_training_config",
+    "create_progressive_training_strategy",
     "BaseScheduler",
     "LinearScheduler",
     "CosineScheduler",
