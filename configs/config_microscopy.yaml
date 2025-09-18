@@ -28,13 +28,13 @@ wandb:
   entity: anna_yoon-uc-berkeley  # Auto-configured from system credentials
   mode: offline  # Default to offline for HPC clusters
 
-# Model configuration - Optimized for 256x256 microscopy images
+# Model configuration - Optimized for 128x128 microscopy images (proven on single A40)
 model:
-  sample_size: 256
+  sample_size: 128
   in_channels: 1  # Will be set to 2 automatically if use_conditioning=true
   out_channels: 1
   layers_per_block: 2
-  block_out_channels: [128, 256, 512, 512]  # Increased capacity for 256x256
+  block_out_channels: [96, 192, 384, 384]   # Same as A40GPU config (proven to work)
   down_block_types: ["DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
   up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"]
   class_embed_type: null
@@ -49,11 +49,11 @@ training:
   learning_rate: 1.0e-4         # Stable learning rate for diffusion models
   weight_decay: 1.0e-6          # L2 regularization
   
-  # Batch and memory settings - Multi-GPU optimized for 4x NVIDIA A40 (192GB total VRAM)
-  batch_size: 16                # Per GPU batch size (total effective = 16*4 = 64)
+  # Batch and memory settings - Optimized for 4x A40 with 128x128 images
+  batch_size: 32                # Per GPU batch size (total effective = 32*4 = 128) - Same as single A40
   num_workers: 32               # Total workers across all GPUs
                                 # Rule: num_workers = total_cpus = 32
-  accumulate_grad_batches: 4    # Effective batch size = 16 * 4 = 64 (large effective batch)
+  accumulate_grad_batches: 3    # Effective batch size = 32 * 4 * 3 = 384 (very large for multi-GPU)
   gradient_clip: 1.0            # Gradient clipping for stability
   
   # Memory optimization - Tuned for A40 (46GB VRAM)
@@ -61,12 +61,12 @@ training:
   prefetch_factor: 8            # Increased prefetch for high-core CPU
   pin_memory: true              # Pin memory for faster GPU transfer
   
-  # GPU Memory scaling guide for 256x256 + conditioning (tested values):
-  # - A40/A100 (40-80GB): batch_size: 16 + accumulate_grad_batches: 4-6
-  # - RTX 4090 (24GB): batch_size: 12 + accumulate_grad_batches: 3-4
-  # - RTX 3090 (24GB): batch_size: 8 + accumulate_grad_batches: 4
-  # - RTX 3080 (10GB): batch_size: 4 + accumulate_grad_batches: 4
-  # - RTX 3070 (8GB): batch_size: 2 + accumulate_grad_batches: 8
+  # GPU Memory scaling guide for 128x128 images (proven values):
+  # - A40/A100 (40-80GB): batch_size: 32 + accumulate_grad_batches: 3 (current, proven)
+  # - RTX 4090 (24GB): batch_size: 24 + accumulate_grad_batches: 3
+  # - RTX 3090 (24GB): batch_size: 16 + accumulate_grad_batches: 4
+  # - RTX 3080 (10GB): batch_size: 8 + accumulate_grad_batches: 4
+  # - RTX 3070 (8GB): batch_size: 4 + accumulate_grad_batches: 6
   
   # Model training enhancements
   use_ema: true                 # Exponential moving average for stable inference
@@ -97,12 +97,12 @@ training:
   log_every_n_steps: 100        # Log metrics every 100 steps
   
   # Advanced training options
-  steps_per_epoch: 1000         # Limit steps per epoch for consistent timing
+  steps_per_epoch: 549          # Optimized for batch size 32 (549 * 32 * 4 = 70,272 samples/epoch)
   precision: 16-mixed           # Mixed precision training
   
 # Data configuration
 data:
-  image_size: 256               # Image size for training
+  image_size: 128               # Image size for training (same as proven A40GPU config)
   min_intensity: 0              # Minimum intensity value
   max_intensity: 255            # Maximum intensity value (adjust based on your data)
   noise_model: poisson          # poisson, gaussian, poisson_gaussian

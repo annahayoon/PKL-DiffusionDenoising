@@ -52,6 +52,21 @@ from PIL import Image
 import tifffile
 import json
 
+# PyTorch Lightning imports
+try:
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+    from pytorch_lightning.loggers import WandbLogger
+    HAS_LIGHTNING = True
+    print(f"✅ PyTorch Lightning {pl.__version__} imported successfully")
+except ImportError as e:
+    HAS_LIGHTNING = False
+    print(f"❌ PyTorch Lightning import failed: {e}")
+    import traceback
+    traceback.print_exc()
+
+# Debug: print(f"🔍 HAS_LIGHTNING = {HAS_LIGHTNING}")
+
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -160,6 +175,21 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     
+    # Clear GPU memory and optimize for A40 Tensor Cores
+    if torch.cuda.is_available():
+        # Clean GPU memory before training
+        import gc
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Optimize for A40 Tensor Cores and performance
+        torch.set_float32_matmul_precision('medium')  # Optimize for A40 Tensor Cores
+        torch.backends.cudnn.benchmark = True  # Optimize cuDNN for consistent input sizes
+        torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster training
+        torch.backends.cudnn.allow_tf32 = True  # Enable TF32 for cuDNN
+    
     # Initialize W&B if enabled
     if cfg.wandb.mode != "disabled":
         # Create run name with config name and date
@@ -176,7 +206,6 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
             mode=cfg.wandb.mode,
             tags=[config_name, cfg.experiment.name, f"seed_{seed}"]
         )
-        print(f"✅ Initialized Weights & Biases logging: {run_name}")
 
     # Setup device and paths
     device = str(cfg.experiment.device)
@@ -536,7 +565,19 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         weight_decay=float(getattr(cfg.training, "weight_decay", 1e-4))
     )
 
-    scaler = GradScaler() if cfg.training.get("mixed_precision", False) and device == "cuda" else None
+    # Configure automatic mixed precision (AMP) based on config
+    precision_str = str(getattr(cfg.training, "precision", "")).lower()
+    use_amp = (
+        device == "cuda"
+        and (
+            ("16" in precision_str) or ("mixed" in precision_str)
+            or bool(getattr(cfg.experiment, "mixed_precision", False))
+        )
+    )
+    amp_dtype = torch.bfloat16 if "bf16" in precision_str else torch.float16
+    scaler = GradScaler(enabled=use_amp and ("bf16" not in precision_str))
+    if use_amp:
+        print(f"✅ Using AMP with dtype: {'bf16' if amp_dtype == torch.bfloat16 else 'fp16'}")
     
     max_epochs = int(cfg.training.max_epochs)
     save_every = int(getattr(cfg.training, "save_every_n_epochs", 10))
@@ -546,152 +587,266 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
     print(f"Batch size: {cfg.training.batch_size}")
     print(f"Learning rate: {cfg.training.learning_rate}")
 
-    # Training loop
-    best_loss = float('inf')
-    
-    for epoch in range(max_epochs):
-        ddpm_trainer.train()
-        epoch_loss = 0.0
-        num_batches = 0
-
-        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{max_epochs}", leave=False)
+    # Use PyTorch Lightning training if available
+    if HAS_LIGHTNING:
+        print("🚀 Using PyTorch Lightning training with automatic early stopping")
         
-        for batch_idx, batch in enumerate(progress):
-            # Move batch to device
-            if isinstance(batch, (tuple, list)):
-                batch = [b.to(device, non_blocking=True) for b in batch]
-            else:
-                batch = batch.to(device, non_blocking=True)
+        # Setup Lightning logger
+        wandb_logger = None
+        if cfg.wandb.mode != "disabled":
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            config_name = Path(args.config).stem if args.config else "default"
+            run_name = f"{config_name}_{cfg.experiment.name}_{timestamp}"
+            
+            wandb_logger = WandbLogger(
+                project=cfg.wandb.project,
+                entity=cfg.wandb.entity,
+                name=run_name,
+                mode=cfg.wandb.mode,
+                tags=[config_name, cfg.experiment.name, f"seed_{cfg.experiment.seed}"]
+            )
+            print(f"✅ Initialized Lightning W&B logger: {run_name}")
 
-            optimizer.zero_grad()
+        # Setup Lightning callbacks
+        callbacks = []
+        
+        # Model checkpoint callback - step-based saving (DDPM standard)
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename='ddpm-{step:06d}-{val/loss:.4f}',
+            monitor='val/loss',  # Lightning uses 'val/loss' format
+            mode='min',
+            save_top_k=3,
+            save_last=True,
+            every_n_train_steps=10000,  # Save every 10K steps (main checkpoints)
+            verbose=True
+        )
+        callbacks.append(checkpoint_callback)
+        
+        # Intermediate checkpoint callback - more frequent saves for recovery
+        intermediate_checkpoint_callback = ModelCheckpoint(
+            dirpath=checkpoint_dir / "intermediate",
+            filename='ddpm-intermediate-{step:06d}',
+            every_n_train_steps=5000,  # Intermediate saves every 5K steps
+            save_top_k=2,  # Keep only last 2 intermediate checkpoints
+            save_last=False,  # Don't duplicate last checkpoint
+            verbose=False  # Less verbose for intermediate saves
+        )
+        callbacks.append(intermediate_checkpoint_callback)
+        
+        # Early stopping callback - step-based
+        early_stop_callback = EarlyStopping(
+            monitor='val/loss',  # Lightning uses 'val/loss' format
+            patience=cfg.training.get('early_stopping_patience_steps', 10),  # 10 validation cycles
+            min_delta=cfg.training.get('early_stopping_min_delta', 1e-5),
+            mode='min',
+            verbose=True,
+            check_on_train_epoch_end=False  # Check on validation, not epoch end
+        )
+        callbacks.append(early_stop_callback)
+        
+        # Setup Lightning trainer with performance optimizations
+        trainer = pl.Trainer(
+            max_epochs=max_epochs,
+            accelerator='gpu' if device == 'cuda' else 'cpu',
+            devices=1,  # Single GPU for now
+            precision='16-mixed' if use_amp else '32-true',
+            callbacks=callbacks,
+            logger=wandb_logger,
+            gradient_clip_val=grad_clip_val,
+            accumulate_grad_batches=int(cfg.training.get('accumulate_grad_batches', 1)),
+            log_every_n_steps=int(cfg.training.get('log_every_n_steps', 100)),
+            val_check_interval=int(cfg.training.get('val_check_steps', 2500)),  # Validate every 2.5K steps
+            limit_val_batches=float(cfg.training.get('limit_val_batches', 1.0)),  # Limit validation batches for speed
+            enable_progress_bar=True,
+            enable_model_summary=False,  # Disable for speed
+            deterministic=False,  # For performance
+            benchmark=True,  # Enable cuDNN benchmarking
+            inference_mode=False,  # Keep gradients for validation
+            sync_batchnorm=False,  # Not needed for single GPU
+            num_sanity_val_steps=0,  # Skip sanity check for faster startup
+        )
+        
+        # Train the model
+        trainer.fit(ddpm_trainer, train_loader, val_loader)
+        
+        print(f"✅ Lightning training completed!")
+        print(f"📁 Checkpoints saved to: {checkpoint_dir}")
+        print(f"🏆 Best model path: {checkpoint_callback.best_model_path}")
+        print(f"🏆 Best model score: {checkpoint_callback.best_model_score:.6f}")
+        
+        logger.info(f"Lightning training completed!")
+        logger.info(f"Best model path: {checkpoint_callback.best_model_path}")
+        logger.info(f"Best model score: {checkpoint_callback.best_model_score:.6f}")
+        
+    else:
+        # Fallback to manual training loop if Lightning is not available
+        print("⚠️ PyTorch Lightning not available, using manual training loop")
+        print("🚀 Starting manual training with manual early stopping")
+        
+        best_loss = float('inf')
+        patience = cfg.training.get('early_stopping_patience', 25)
+        min_delta = cfg.training.get('early_stopping_min_delta', 1e-5)
+        epochs_without_improvement = 0
+        
+        for epoch in range(max_epochs):
+            ddpm_trainer.train()
+            epoch_loss = 0.0
+            num_batches = 0
 
-            # Forward pass with mixed precision
-            if scaler is not None:
-                with autocast():
+            progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{max_epochs}", leave=False)
+            
+            for batch_idx, batch in enumerate(progress):
+                # Move batch to device
+                if isinstance(batch, (tuple, list)):
+                    batch = [b.to(device, non_blocking=True) for b in batch]
+                else:
+                    batch = batch.to(device, non_blocking=True)
+
+                optimizer.zero_grad()
+
+                # Forward pass with mixed precision when enabled
+                if use_amp:
+                    # Prefer new torch.amp.autocast API when available, else fall back
+                    try:
+                        with torch.amp.autocast('cuda', dtype=amp_dtype):
+                            loss = ddpm_trainer.training_step(batch, batch_idx)
+                    except Exception:
+                        # Older API: torch.cuda.amp.autocast (no device_type kw)
+                        with autocast(dtype=amp_dtype):
+                            loss = ddpm_trainer.training_step(batch, batch_idx)
+                    
+                    scaler.scale(loss).backward()
+                    
+                    if grad_clip_val > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(ddpm_trainer.parameters(), grad_clip_val)
+                    
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
                     loss = ddpm_trainer.training_step(batch, batch_idx)
-                
-                scaler.scale(loss).backward()
-                
-                if grad_clip_val > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(ddpm_trainer.parameters(), grad_clip_val)
-                
-                scaler.step(optimizer)
-                scaler.update()
+                    loss.backward()
+                    
+                    if grad_clip_val > 0:
+                        torch.nn.utils.clip_grad_norm_(ddpm_trainer.parameters(), grad_clip_val)
+                    
+                    optimizer.step()
+
+                epoch_loss += loss.item()
+                num_batches += 1
+
+                # Update progress bar
+                progress.set_postfix({
+                    'loss': f'{loss.item():.6f}',
+                    'avg_loss': f'{epoch_loss/num_batches:.6f}'
+                })
+
+                # Memory cleanup
+                if batch_idx % 50 == 0:
+                    cleanup_memory()
+
+            # Calculate average training loss
+            avg_train_loss = epoch_loss / num_batches
+            print(f"Epoch {epoch+1}/{max_epochs} - Train Loss: {avg_train_loss:.6f}")
+            logger.info(f"Epoch {epoch+1}/{max_epochs} - Train Loss: {avg_train_loss:.6f}")
+
+            # Update EMA if enabled
+            if hasattr(ddpm_trainer, 'ema_model') and ddpm_trainer.ema_model is not None:
+                ddpm_trainer.update_ema()
+
+            # Run validation at end of epoch
+            ddpm_trainer.eval()
+            val_loss = 0.0
+            val_batches = 0
+            
+            with torch.no_grad():
+                val_progress = tqdm(val_loader, desc=f"Validation {epoch+1}/{max_epochs}", leave=False)
+                for val_batch_idx, val_batch in enumerate(val_progress):
+                    # Move batch to device
+                    if isinstance(val_batch, (tuple, list)):
+                        val_batch = [b.to(device, non_blocking=True) for b in val_batch]
+                    else:
+                        val_batch = val_batch.to(device, non_blocking=True)
+                    
+                    # Validation step
+                    val_step_loss = ddpm_trainer.validation_step(val_batch, val_batch_idx)
+                    val_loss += val_step_loss.item()
+                    val_batches += 1
+                    
+                    val_progress.set_postfix({'val_loss': f'{val_step_loss.item():.6f}'})
+            
+            avg_val_loss = val_loss / val_batches if val_batches > 0 else float('inf')
+            print(f"Epoch {epoch+1}/{max_epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+            logger.info(f"Epoch {epoch+1}/{max_epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+
+            # Early stopping logic
+            if avg_val_loss < best_loss - min_delta:
+                best_loss = avg_val_loss
+                epochs_without_improvement = 0
+                is_best = True
+                logger.info(f"New best model found with val loss: {best_loss:.6f}")
             else:
-                loss = ddpm_trainer.training_step(batch, batch_idx)
-                loss.backward()
+                epochs_without_improvement += 1
+                is_best = False
+                logger.info(f"No improvement for {epochs_without_improvement}/{patience} epochs")
                 
-                if grad_clip_val > 0:
-                    torch.nn.utils.clip_grad_norm_(ddpm_trainer.parameters(), grad_clip_val)
+            # Check early stopping
+            if epochs_without_improvement >= patience:
+                print(f"🛑 Early stopping triggered after {patience} epochs without improvement")
+                print(f"Best validation loss: {best_loss:.6f}")
+                logger.info(f"Early stopping triggered after {patience} epochs without improvement")
+                logger.info(f"Best validation loss: {best_loss:.6f}")
+                break
+
+            if (epoch + 1) % save_every == 0 or is_best or epoch == max_epochs - 1:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': ddpm_trainer.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scaler_state_dict': scaler.state_dict() if scaler else None,
+                    'train_loss': avg_train_loss,
+                    'val_loss': avg_val_loss,
+                    'best_val_loss': best_loss,
+                    'config': cfg,
+                    'args': vars(args),
+                    'timestamp': str(Path(__file__).stat().st_mtime),  # Training script timestamp
+                }
                 
-                optimizer.step()
+                checkpoint_path = checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pt'
+                torch.save(checkpoint, checkpoint_path)
+                logger.info(f"Saved checkpoint: {checkpoint_path}")
+                
+                if is_best:
+                    best_path = checkpoint_dir / 'best_model.pt'
+                    torch.save(checkpoint, best_path)
+                    print(f"💾 Saved best model: {best_path}")
+                    logger.info(f"Saved best model: {best_path}")
+                
+                latest_path = checkpoint_dir / 'latest_checkpoint.pt'
+                torch.save(checkpoint, latest_path)
 
-            epoch_loss += loss.item()
-            num_batches += 1
-
-            # Update progress bar
-            progress.set_postfix({
-                'loss': f'{loss.item():.6f}',
-                'avg_loss': f'{epoch_loss/num_batches:.6f}'
-            })
+            # W&B logging for manual training
+            if cfg.wandb.mode != "disabled":
+                wandb.log({
+                    "epoch": epoch,
+                    "train_loss": avg_train_loss,
+                    "val_loss": avg_val_loss,
+                    "best_val_loss": best_loss,
+                    "learning_rate": optimizer.param_groups[0]['lr']
+                })
 
             # Memory cleanup
-            if batch_idx % 50 == 0:
-                cleanup_memory()
+            cleanup_memory()
 
-        # Calculate average loss
-        avg_loss = epoch_loss / num_batches
-        print(f"Epoch {epoch+1}/{max_epochs} - Average Loss: {avg_loss:.6f}")
-        logger.info(f"Epoch {epoch+1}/{max_epochs} - Average Loss: {avg_loss:.6f}")
-
-        # Update EMA if enabled
-        if hasattr(ddpm_trainer, 'ema_model') and ddpm_trainer.ema_model is not None:
-            ddpm_trainer.update_ema()
-
-        # Save checkpoint
-        is_best = avg_loss < best_loss
-        if is_best:
-            best_loss = avg_loss
-            logger.info(f"New best model found with loss: {best_loss:.6f}")
-
-        if (epoch + 1) % save_every == 0 or is_best or epoch == max_epochs - 1:
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': ddpm_trainer.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict() if scaler else None,
-                'loss': avg_loss,
-                'best_loss': best_loss,
-                'config': cfg,
-                'args': vars(args),
-                'timestamp': str(Path(__file__).stat().st_mtime),  # Training script timestamp
-            }
-            
-            checkpoint_path = checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pt'
-            torch.save(checkpoint, checkpoint_path)
-            logger.info(f"Saved checkpoint: {checkpoint_path}")
-            
-            if is_best:
-                best_path = checkpoint_dir / 'best_model.pt'
-                torch.save(checkpoint, best_path)
-                print(f"💾 Saved best model: {best_path}")
-                logger.info(f"Saved best model: {best_path}")
-            
-            latest_path = checkpoint_dir / 'latest_checkpoint.pt'
-            torch.save(checkpoint, latest_path)
-
-        # Enhanced W&B logging
+        print(f"✅ Manual training completed! Best loss: {best_loss:.6f}")
+        print(f"📁 Checkpoints saved to: {checkpoint_dir}")
+        logger.info(f"Manual training completed! Best loss: {best_loss:.6f}")
+        
+        # Close W&B run if enabled
         if cfg.wandb.mode != "disabled":
-            log_dict = {
-                "epoch": epoch,
-                "train_loss": avg_loss,
-                "best_loss": best_loss,
-                "learning_rate": optimizer.param_groups[0]['lr'],
-                "batch_size": cfg.training.batch_size,
-                "device": device,
-            }
-            
-            # Log gradient norms and parameter statistics
-            total_grad_norm = 0
-            total_param_norm = 0
-            for name, param in ddpm_trainer.named_parameters():
-                if param.grad is not None:
-                    param_grad_norm = param.grad.data.norm(2)
-                    total_grad_norm += param_grad_norm.item() ** 2
-                    log_dict[f"grad_norm/{name}"] = param_grad_norm.item()
-                
-                param_norm = param.data.norm(2)
-                total_param_norm += param_norm.item() ** 2
-                log_dict[f"param_norm/{name}"] = param_norm.item()
-            
-            log_dict["total_grad_norm"] = total_grad_norm ** 0.5
-            log_dict["total_param_norm"] = total_param_norm ** 0.5
-            
-            # Log parameter histograms to W&B every 10 epochs
-            if (epoch + 1) % 10 == 0:
-                for name, param in ddpm_trainer.named_parameters():
-                    if param.grad is not None:
-                        log_dict[f"gradients/{name}"] = wandb.Histogram(param.grad.detach().cpu().numpy())
-                    log_dict[f"parameters/{name}"] = wandb.Histogram(param.detach().cpu().numpy())
-            
-            # Log memory usage if CUDA is available
-            if device == "cuda" and torch.cuda.is_available():
-                log_dict["gpu_memory_allocated"] = torch.cuda.memory_allocated() / 1024**3  # GB
-                log_dict["gpu_memory_reserved"] = torch.cuda.memory_reserved() / 1024**3  # GB
-            
-            wandb.log(log_dict)
-
-        # Memory cleanup
-        cleanup_memory()
-
-    print(f"✅ Training completed! Best loss: {best_loss:.6f}")
-    print(f"📁 Checkpoints saved to: {checkpoint_dir}")
-    logger.info(f"Training completed! Best loss: {best_loss:.6f}")
-    
-    # Close W&B run if enabled
-    if cfg.wandb.mode != "disabled":
-        wandb.finish()
+            wandb.finish()
         
     return ddpm_trainer
 

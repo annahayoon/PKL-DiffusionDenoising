@@ -305,11 +305,7 @@ def build_psf_bank(bead_root: str | Path) -> Dict[str, torch.Tensor]:
     if not bank:
         raise ValueError(f"No bead images found under {root}")
     
-    # Print pixel size information if available
-    for mode, psf_tensor in bank.items():
-        if hasattr(psf_tensor, "pixel_size_xy_nm"):
-            print(f"PSF {mode}: XY pixel size = {psf_tensor.pixel_size_xy_nm} nm, "
-                  f"Z pixel size = {getattr(psf_tensor, 'pixel_size_z_nm', 'N/A')} nm")
+    # Pixel size information is stored in PSF tensors for internal use
     
     return bank
 

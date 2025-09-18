@@ -52,4 +52,7 @@ ipywidgets>=8.0.0,<9.0.0
 psutil>=5.9.0,<6.0.0  # For memory monitoring
 rawpy>=0.18.0,<0.20.0  # For RAW image processing (SID dataset)
 
+# Compression support
+backports.lzma>=0.0.14  # Fallback for lzma compression (built into Python 3.3+ but may not be available in all environments)
+
 

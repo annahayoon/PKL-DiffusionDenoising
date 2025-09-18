@@ -802,6 +802,11 @@ class DDPMTrainer(LightningModuleBase):
                 self.ema_model.parameters(), self.model.parameters()
             ):
                 ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+    
+    def update_ema(self, decay: float = 0.999):
+        """Public method to update EMA model parameters."""
+        if self.use_ema and self.ema_model is not None:
+            self._update_ema(decay)
 
     def validation_step(self, batch, batch_idx):
         x_0, c_wf = batch
