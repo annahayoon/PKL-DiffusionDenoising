@@ -2,11 +2,10 @@
 Loss functions for diffusion models.
 
 This module consolidates various loss functions used in diffusion training,
-including perceptual losses, frequency domain losses, and consistency losses.
+including frequency domain losses and consistency losses.
 
 Features:
 - Basic losses (MSE, L1, Huber)
-- Perceptual losses using pre-trained networks
 - Frequency domain losses (Fourier, Wavelet, Spectral)
 - Multi-scale frequency consistency
 - High-frequency detail preservation
@@ -66,74 +65,6 @@ class HuberLoss(nn.Module):
         
     def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return F.huber_loss(predicted, target, delta=self.delta, reduction=self.reduction)
-
-
-class PerceptualLoss(nn.Module):
-    """Perceptual loss using pre-trained VGG features."""
-    
-    def __init__(self, 
-                 feature_layers: List[str] = ['relu1_1', 'relu2_1', 'relu3_1', 'relu4_1'],
-                 weights: Optional[List[float]] = None,
-                 normalize_features: bool = True):
-        super().__init__()
-        
-        if not TORCHVISION_AVAILABLE:
-            raise ImportError("torchvision is required for PerceptualLoss")
-            
-        self.feature_layers = feature_layers
-        self.weights = weights or [1.0] * len(feature_layers)
-        self.normalize_features = normalize_features
-        
-        # Load pre-trained VGG
-        vgg = models.vgg19(pretrained=True).features
-        self.feature_extractor = nn.ModuleDict()
-        
-        layer_mapping = {
-            'relu1_1': 1, 'relu1_2': 3,
-            'relu2_1': 6, 'relu2_2': 8,
-            'relu3_1': 11, 'relu3_2': 13, 'relu3_3': 15, 'relu3_4': 17,
-            'relu4_1': 20, 'relu4_2': 22, 'relu4_3': 24, 'relu4_4': 26,
-            'relu5_1': 29, 'relu5_2': 31, 'relu5_3': 33, 'relu5_4': 35,
-        }
-        
-        for layer_name in feature_layers:
-            if layer_name not in layer_mapping:
-                raise ValueError(f"Unknown layer: {layer_name}")
-            layer_idx = layer_mapping[layer_name]
-            self.feature_extractor[layer_name] = nn.Sequential(*list(vgg.children())[:layer_idx+1])
-            
-        # Freeze parameters
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = False
-            
-        # Normalization for pre-trained models
-        self.normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        
-    def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute perceptual loss between predicted and target images."""
-        # Convert grayscale to RGB if needed
-        if predicted.shape[1] == 1:
-            predicted = predicted.repeat(1, 3, 1, 1)
-        if target.shape[1] == 1:
-            target = target.repeat(1, 3, 1, 1)
-            
-        # Normalize inputs
-        predicted = self.normalize(predicted)
-        target = self.normalize(target)
-        
-        loss = 0.0
-        for i, layer_name in enumerate(self.feature_layers):
-            pred_features = self.feature_extractor[layer_name](predicted)
-            target_features = self.feature_extractor[layer_name](target)
-            
-            if self.normalize_features:
-                pred_features = F.normalize(pred_features, dim=1)
-                target_features = F.normalize(target_features, dim=1)
-                
-            layer_loss = F.mse_loss(pred_features, target_features)
-            loss += self.weights[i] * layer_loss
-            
-        return loss
 
 
 class FourierLoss(nn.Module):
@@ -588,8 +519,6 @@ def create_loss_function(loss_config: Dict[str, Any]) -> nn.Module:
         return L1Loss(**loss_config.get("params", {}))
     elif loss_type == "huber":
         return HuberLoss(**loss_config.get("params", {}))
-    elif loss_type == "perceptual":
-        return PerceptualLoss(**loss_config.get("params", {}))
     elif loss_type == "fourier":
         return FourierLoss(**loss_config.get("params", {}))
     elif loss_type == "wavelet":
@@ -687,8 +616,6 @@ __all__ = [
     "L1Loss", 
     "HuberLoss",
     
-    # Perceptual losses
-    "PerceptualLoss",
     
     # Frequency domain losses
     "FourierLoss",

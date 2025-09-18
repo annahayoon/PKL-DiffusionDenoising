@@ -32,12 +32,11 @@ Based on your data constraints and objectives, here's the **optimal strategy** t
 
 #### 1. **Multi-Component Loss Function**
 ```python
-Total Loss = α·Diffusion_Loss + β·Intensity_Loss + γ·Perceptual_Loss + δ·Gradient_Loss
+Total Loss = α·Diffusion_Loss + β·Intensity_Loss + δ·Gradient_Loss
 
 Where:
 - Diffusion_Loss: Standard DDPM loss (spatial structure)
 - Intensity_Loss: MSE loss (pixel-wise accuracy) 
-- Perceptual_Loss: VGG-based loss (spatial quality)
 - Gradient_Loss: Edge preservation (sharpness)
 ```
 

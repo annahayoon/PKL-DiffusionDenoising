@@ -670,8 +670,9 @@ def run_training(cfg: DictConfig, args) -> DDPMTrainer:
         training_cfg["ddpm_loss_weight"] = 1.0
     if "cycle_loss_weight" not in training_cfg:
         training_cfg["cycle_loss_weight"] = 0.1
+    # Ensure perceptual loss is disabled (pure self-supervised approach)
     if "perceptual_loss_weight" not in training_cfg:
-        training_cfg["perceptual_loss_weight"] = 0.01
+        training_cfg["perceptual_loss_weight"] = 0.0
 
     ddpm_trainer = DDPMTrainer(
         model=unet,

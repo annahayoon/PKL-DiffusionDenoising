@@ -140,15 +140,15 @@ training:
   # DUAL OBJECTIVE TRAINING - Default enabled for spatial + intensity optimization
   use_dual_objective_loss: true # Enable dual objective loss (spatial resolution + pixel intensity)
   
-  # Dual objective loss configuration
+  # PURE SELF-SUPERVISED dual objective loss configuration
   dual_objective_loss:
-    # Loss component weights (adaptive during training)
+    # Loss component weights (adaptive during training) - NO SUPERVISED COMPONENTS
     alpha_diffusion: 1.0        # Weight for diffusion loss (spatial structure)
     beta_intensity: 0.6         # Weight for intensity mapping loss (pixel accuracy)
-    gamma_perceptual: 0.2       # Weight for perceptual loss (spatial quality)
+    gamma_perceptual: 0.0       # DISABLED - No supervised VGG features
     delta_gradient: 0.4         # Weight for gradient loss (edge sharpness)
     
-    # Loss configurations
+    # Loss configurations - All self-supervised
     intensity_loss_type: "mse"  # mse, l1, smooth_l1
     gradient_loss_type: "l1"    # l1, l2, smooth_l1
     intensity_weight_mode: "adaptive"  # adaptive, fixed
@@ -157,16 +157,17 @@ training:
     use_adaptive_weighting: true
     warmup_steps: 1000          # Steps to reach full intensity weight
     
-    # Optional perceptual loss
-    use_perceptual_loss: true
-    perceptual_layers: ["relu2_2", "relu3_3", "relu4_3"]
+    # NO SUPERVISED PERCEPTUAL LOSS - maintains self-supervised purity
+    use_perceptual_loss: false  # DISABLED - VGG contradicts self-supervised approach
+    perceptual_layers: []       # Empty - no supervised features
   
-  supervised_x0_weight: 0.0     # Disabled for pure self-supervised learning
-  ddpm_loss_weight: 1.0         # Weight for standard DDPM loss
-  cycle_loss_weight: 0.15       # Weight for cycle consistency loss (slightly higher)
-  perceptual_loss_weight: 0.01  # Weight for perceptual loss
+  # PURE SELF-SUPERVISED LEARNING - No supervised components
+  supervised_x0_weight: 0.0     # DISABLED - Pure self-supervised learning
+  ddpm_loss_weight: 1.0         # Self-supervised diffusion loss
+  cycle_loss_weight: 0.15       # Self-supervised cycle consistency  
+  perceptual_loss_weight: 0.0   # DISABLED - No supervised VGG features
   cycle_loss_type: smooth_l1    # smooth_l1, l1, or l2 (smooth_l1 is more robust)
-  use_perceptual_loss: true     # Enable perceptual loss for better quality
+  use_perceptual_loss: false    # DISABLED - Maintains self-supervised purity
   
   # STEP-BASED validation and checkpointing
   val_check_interval: 500       # Validate every 500 steps (must be ≤ 525 batches per epoch)

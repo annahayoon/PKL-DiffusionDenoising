@@ -1,20 +1,19 @@
 """
 Dual-Objective Loss for Spatial Resolution and Pixel Intensity Prediction
 
-This module implements a comprehensive dual-objective training system optimized for:
+This module implements a pure self-supervised dual-objective training system optimized for:
 1. Spatial resolution (sharpness) enhancement
 2. Pixel intensity (signal mapping) prediction
 
 Components:
-- DualObjectiveLoss: Multi-component loss function combining diffusion, intensity, gradient, and perceptual losses
+- DualObjectiveLoss: Multi-component loss function combining diffusion, intensity, and gradient losses
 - IntensityAugmentation: Specialized data augmentation for intensity mapping with limited 2P dynamic range
 - Configuration utilities: Functions to create optimized training configurations and progressive training strategies
 
-The loss combines:
+The loss combines (all self-supervised):
 - Diffusion Loss: Standard DDPM loss for spatial structure learning
 - Intensity Loss: MSE loss for pixel-wise intensity accuracy
 - Gradient Loss: Edge preservation for sharpness
-- Perceptual Loss: Spatial quality assessment (optional)
 """
 
 import torch
@@ -153,17 +152,18 @@ class IntensityMappingLoss(nn.Module):
 
 class DualObjectiveLoss(nn.Module):
     """
-    Multi-component loss function for dual objectives:
+    Pure self-supervised multi-component loss function for dual objectives:
     1. Spatial resolution (sharpness)
     2. Pixel intensity (signal mapping)
+    
+    NO supervised components (VGG, ImageNet features, etc.)
     """
     
     def __init__(
         self,
-        # Loss component weights
+        # Loss component weights (self-supervised only)
         alpha_diffusion: float = 1.0,
         beta_intensity: float = 0.6,
-        gamma_perceptual: float = 0.2,
         delta_gradient: float = 0.4,
         
         # Loss component configurations
@@ -173,32 +173,24 @@ class DualObjectiveLoss(nn.Module):
         
         # Adaptive weighting
         use_adaptive_weighting: bool = True,
-        warmup_steps: int = 1000,
-        
-        # Optional components
-        use_perceptual_loss: bool = False,
-        perceptual_layers: Optional[list] = None
+        warmup_steps: int = 1000
     ):
         """
         Args:
             alpha_diffusion: Weight for diffusion loss (spatial structure)
             beta_intensity: Weight for intensity mapping loss
-            gamma_perceptual: Weight for perceptual loss (if enabled)
             delta_gradient: Weight for gradient loss (sharpness)
             intensity_loss_type: Type of intensity loss ("mse", "l1", "smooth_l1")
             gradient_loss_type: Type of gradient loss ("l1", "l2", "smooth_l1")
             intensity_weight_mode: Intensity weighting strategy
             use_adaptive_weighting: Whether to adapt weights during training
             warmup_steps: Steps to gradually increase intensity loss weight
-            use_perceptual_loss: Whether to include perceptual loss
-            perceptual_layers: Which layers to use for perceptual loss
         """
         super().__init__()
         
-        # Store weights
+        # Store weights (self-supervised only)
         self.alpha_diffusion = alpha_diffusion
         self.beta_intensity = beta_intensity
-        self.gamma_perceptual = gamma_perceptual
         self.delta_gradient = delta_gradient
         
         # Adaptive weighting parameters
@@ -213,42 +205,6 @@ class DualObjectiveLoss(nn.Module):
         )
         
         self.gradient_loss = GradientLoss(loss_type=gradient_loss_type)
-        
-        # Optional perceptual loss
-        self.use_perceptual_loss = use_perceptual_loss
-        if use_perceptual_loss:
-            try:
-                # Try to use torchvision VGG for perceptual loss
-                import torchvision.models as models
-                self.vgg = models.vgg16(pretrained=True).features[:16]  # Up to relu3_3
-                for param in self.vgg.parameters():
-                    param.requires_grad = False
-                self.vgg.eval()
-            except ImportError:
-                print("Warning: torchvision not available, disabling perceptual loss")
-                self.use_perceptual_loss = False
-                self.vgg = None
-        else:
-            self.vgg = None
-    
-    def _compute_perceptual_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute perceptual loss using VGG features."""
-        if not self.use_perceptual_loss or self.vgg is None:
-            return torch.tensor(0.0, device=pred.device)
-        
-        # Convert single channel to RGB if needed
-        if pred.shape[1] == 1:
-            pred_rgb = pred.repeat(1, 3, 1, 1)
-            target_rgb = target.repeat(1, 3, 1, 1)
-        else:
-            pred_rgb = pred
-            target_rgb = target
-        
-        # Extract VGG features
-        pred_features = self.vgg(pred_rgb)
-        target_features = self.vgg(target_rgb)
-        
-        return F.mse_loss(pred_features, target_features)
     
     def _get_adaptive_weights(self, step: int) -> Dict[str, float]:
         """Get adaptive weights based on training progress."""
@@ -256,7 +212,6 @@ class DualObjectiveLoss(nn.Module):
             return {
                 'alpha': self.alpha_diffusion,
                 'beta': self.beta_intensity,
-                'gamma': self.gamma_perceptual,
                 'delta': self.delta_gradient
             }
         
@@ -266,10 +221,9 @@ class DualObjectiveLoss(nn.Module):
         # Start with more focus on diffusion, gradually balance
         alpha = self.alpha_diffusion
         beta = self.beta_intensity * warmup_factor
-        gamma = self.gamma_perceptual * warmup_factor
         delta = self.delta_gradient * (0.5 + 0.5 * warmup_factor)  # Gradual gradient loss
         
-        return {'alpha': alpha, 'beta': beta, 'gamma': gamma, 'delta': delta}
+        return {'alpha': alpha, 'beta': beta, 'delta': delta}
     
     def forward(
         self,
@@ -305,14 +259,10 @@ class DualObjectiveLoss(nn.Module):
         # 3. Gradient loss (edge preservation for sharpness)
         loss_gradient = self.gradient_loss(pred_x0, target_x0)
         
-        # 4. Perceptual loss (spatial quality)
-        loss_perceptual = self._compute_perceptual_loss(pred_x0, target_x0)
-        
-        # Combine losses with adaptive weights
+        # Combine losses with adaptive weights (self-supervised only)
         total_loss = (
             weights['alpha'] * loss_diffusion +
             weights['beta'] * loss_intensity +
-            weights['gamma'] * loss_perceptual +
             weights['delta'] * loss_gradient
         )
         
@@ -321,7 +271,6 @@ class DualObjectiveLoss(nn.Module):
             'diffusion_loss': loss_diffusion,
             'intensity_loss': loss_intensity,
             'gradient_loss': loss_gradient,
-            'perceptual_loss': loss_perceptual,
             'weights': weights
         }
     
@@ -386,14 +335,12 @@ def create_dual_objective_loss(config: Dict) -> DualObjectiveLoss:
     return DualObjectiveLoss(
         alpha_diffusion=loss_config.get('alpha_diffusion', 1.0),
         beta_intensity=loss_config.get('beta_intensity', 0.6),
-        gamma_perceptual=loss_config.get('gamma_perceptual', 0.2),
         delta_gradient=loss_config.get('delta_gradient', 0.4),
         intensity_loss_type=loss_config.get('intensity_loss_type', 'mse'),
         gradient_loss_type=loss_config.get('gradient_loss_type', 'l1'),
         intensity_weight_mode=loss_config.get('intensity_weight_mode', 'adaptive'),
         use_adaptive_weighting=loss_config.get('use_adaptive_weighting', True),
-        warmup_steps=loss_config.get('warmup_steps', 1000),
-        use_perceptual_loss=loss_config.get('use_perceptual_loss', False)
+        warmup_steps=loss_config.get('warmup_steps', 1000)
     )
 
 
@@ -419,11 +366,10 @@ def create_dual_objective_training_config() -> Dict[str, Any]:
             'gradient_clip_val': 1.0,              # Stability with limited range
         },
         
-        # Loss configuration
+        # Loss configuration (self-supervised only)
         'loss': {
             'alpha_diffusion': 1.0,    # Standard diffusion loss
             'beta_intensity': 0.8,     # High weight for intensity mapping
-            'gamma_perceptual': 0.3,   # Spatial quality
             'delta_gradient': 0.4,     # Edge preservation (important for sharpness)
             'intensity_weight_schedule': 'adaptive'
         },
@@ -475,7 +421,6 @@ def create_progressive_training_strategy() -> Dict[str, Any]:
             'loss_weights': {
                 'alpha_diffusion': 1.0,
                 'beta_intensity': 0.2,
-                'gamma_perceptual': 0.5,
                 'delta_gradient': 0.1
             }
         },
@@ -488,7 +433,6 @@ def create_progressive_training_strategy() -> Dict[str, Any]:
             'loss_weights': {
                 'alpha_diffusion': 1.0,
                 'beta_intensity': 0.6,
-                'gamma_perceptual': 0.4,
                 'delta_gradient': 0.3
             }
         },
@@ -501,7 +445,6 @@ def create_progressive_training_strategy() -> Dict[str, Any]:
             'loss_weights': {
                 'alpha_diffusion': 1.0,
                 'beta_intensity': 0.8,
-                'gamma_perceptual': 0.3,
                 'delta_gradient': 0.5
             }
         }

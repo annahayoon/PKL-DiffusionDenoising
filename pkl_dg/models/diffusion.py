@@ -63,12 +63,11 @@ except Exception:  # pragma: no cover - fallback when lightning is unavailable
 
 # Import loss functions from losses module
 try:
-    from .losses import CycleConsistencyLoss, PerceptualLoss, create_loss_function
+    from .losses import CycleConsistencyLoss, create_loss_function
     LOSSES_AVAILABLE = True
 except ImportError:
     LOSSES_AVAILABLE = False
     CycleConsistencyLoss = None
-    PerceptualLoss = None
 
 
 class DDPMTrainer(LightningModuleBase):
@@ -162,11 +161,8 @@ class DDPMTrainer(LightningModuleBase):
             loss_type=self.config.get("cycle_loss_type", "l1")
         )
         
-        # Perceptual loss - configurable pretrained features
-        use_pretrained_perceptual = self.config.get("use_pretrained_perceptual", False)
-        self.perceptual_loss = PerceptualLoss(
-            use_pretrained=use_pretrained_perceptual
-        ) if self.config.get("use_perceptual_loss", False) else None
+        # No perceptual loss - pure self-supervised approach
+        self.perceptual_loss = None
         
         # Loss weights
         self.ddpm_weight = self.config.get("ddpm_loss_weight", 1.0)
@@ -661,7 +657,6 @@ class DDPMTrainer(LightningModuleBase):
                     self._log_if_trainer("train/diffusion_loss", loss_components['diffusion_loss'])
                     self._log_if_trainer("train/intensity_loss", loss_components['intensity_loss'])
                     self._log_if_trainer("train/gradient_loss", loss_components['gradient_loss'])
-                    self._log_if_trainer("train/perceptual_loss", loss_components['perceptual_loss'])
                     
                 else:
                     loss = diffusion_loss
@@ -704,7 +699,6 @@ class DDPMTrainer(LightningModuleBase):
                 self._log_if_trainer("train/diffusion_loss", loss_components['diffusion_loss'])
                 self._log_if_trainer("train/intensity_loss", loss_components['intensity_loss'])
                 self._log_if_trainer("train/gradient_loss", loss_components['gradient_loss'])
-                self._log_if_trainer("train/perceptual_loss", loss_components['perceptual_loss'])
                 
             else:
                 loss = diffusion_loss
@@ -760,6 +754,7 @@ class DDPMTrainer(LightningModuleBase):
         x_0, c_wf = batch
         device = x_0.device
         losses = []
+        
         # Select evaluation timesteps based on configured num_timesteps to avoid OOB indices
         if self.num_timesteps <= 3:
             t_candidates = list(range(max(int(self.num_timesteps) - 1, 1)))
@@ -791,8 +786,31 @@ class DDPMTrainer(LightningModuleBase):
                             noise_pred = self.model(x_t, t)
                     else:
                         noise_pred = self.model(x_t, t)
-                    losses.append(F.mse_loss(noise_pred, noise))
+                    
+                    # Compute diffusion loss
+                    diffusion_loss = F.mse_loss(noise_pred, noise)
+                    
+                    # Use dual objective loss if enabled (same as training)
+                    if self.use_dual_objective_loss and self.dual_objective_loss is not None:
+                        # Reconstruct x0 for dual objective loss
+                        alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+                        sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
+                        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
+                        x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                        
+                        # Apply dual objective loss
+                        loss_components = self.dual_objective_loss(
+                            diffusion_loss=diffusion_loss,
+                            pred_x0=x0_hat,
+                            target_x0=x_0,
+                            step=self.global_step
+                        )
+                        losses.append(loss_components['total_loss'])
+                    else:
+                        # Standard diffusion loss only
+                        losses.append(diffusion_loss)
             else:
+                # Standard precision validation
                 if use_conditioning:
                     try:
                         noise_pred = self.model(x_t, t, cond=c_wf)
@@ -800,7 +818,29 @@ class DDPMTrainer(LightningModuleBase):
                         noise_pred = self.model(x_t, t)
                 else:
                     noise_pred = self.model(x_t, t)
-                losses.append(F.mse_loss(noise_pred, noise))
+                
+                # Compute diffusion loss
+                diffusion_loss = F.mse_loss(noise_pred, noise)
+                
+                # Use dual objective loss if enabled (same as training)
+                if self.use_dual_objective_loss and self.dual_objective_loss is not None:
+                    # Reconstruct x0 for dual objective loss
+                    alpha_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+                    sqrt_alpha_t = torch.sqrt(alpha_t + 1e-8)
+                    sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t + 1e-8)
+                    x0_hat = (x_t - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                    
+                    # Apply dual objective loss
+                    loss_components = self.dual_objective_loss(
+                        diffusion_loss=diffusion_loss,
+                        pred_x0=x0_hat,
+                        target_x0=x_0,
+                        step=self.global_step
+                    )
+                    losses.append(loss_components['total_loss'])
+                else:
+                    # Standard diffusion loss only
+                    losses.append(diffusion_loss)
                 
         avg_loss = torch.stack(losses).mean()
         self._log_if_trainer("val/loss", avg_loss, prog_bar=True)
@@ -1356,7 +1396,7 @@ class DDPMTrainer(LightningModuleBase):
                 "ddpm_weight": getattr(self, 'ddpm_weight', 1.0),
                 "cycle_weight": getattr(self, 'cycle_weight', 0.1),
                 "perceptual_weight": getattr(self, 'perceptual_weight', 0.01),
-                "has_perceptual_loss": hasattr(self, 'perceptual_loss') and self.perceptual_loss is not None,
+                "has_perceptual_loss": False,
                 "cycle_loss_type": getattr(self.cycle_loss, 'loss_type', 'l1') if hasattr(self, 'cycle_loss') else None,
             })
         

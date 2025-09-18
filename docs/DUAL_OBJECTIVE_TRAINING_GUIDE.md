@@ -22,14 +22,13 @@ Your dual-objective loss implementation is now **complete and tested**! This gui
 
 ## 🏗️ **Architecture Overview**
 
-### **Multi-Component Loss Function:**
+### **Pure Self-Supervised Loss Function:**
 ```
-Total Loss = α·Diffusion + β·Intensity + γ·Perceptual + δ·Gradient
+Total Loss = α·Diffusion + β·Intensity + δ·Gradient
 
 Where:
 • α=1.0: Diffusion Loss (spatial structure learning)
 • β=0.8: Intensity Loss (pixel-wise accuracy) 
-• γ=0.2: Perceptual Loss (spatial quality)
 • δ=0.5: Gradient Loss (edge preservation)
 ```
 
@@ -61,7 +60,6 @@ python scripts/run_microscopy.py \
 train/diffusion_loss  → Spatial structure learning
 train/intensity_loss  → Pixel intensity accuracy  
 train/gradient_loss   → Edge preservation (sharpness)
-train/perceptual_loss → Overall spatial quality
 ```
 
 ---
